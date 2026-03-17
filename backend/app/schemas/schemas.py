@@ -59,6 +59,17 @@ class AgentRegister(BaseModel):
     command: str = Field(..., max_length=500)
     default_args: str | None = None
     max_timeout: int = Field(default=300, ge=10, le=3600)
+    permission_mode: str = Field(default="acceptEdits", max_length=30)
+    allowed_tools: str | None = None
+    system_prompt: str | None = None
+
+
+class AgentUpdate(BaseModel):
+    display_name: str | None = None
+    permission_mode: str | None = None
+    allowed_tools: str | None = None
+    system_prompt: str | None = None
+    max_timeout: int | None = Field(default=None, ge=10, le=3600)
 
 
 class AgentResponse(BaseModel):
@@ -70,6 +81,9 @@ class AgentResponse(BaseModel):
     default_args: str | None
     enabled: bool
     max_timeout: int
+    permission_mode: str
+    allowed_tools: str | None
+    system_prompt: str | None
     created_at: datetime
 
     model_config = {"from_attributes": True}

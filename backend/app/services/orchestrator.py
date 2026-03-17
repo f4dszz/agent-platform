@@ -56,6 +56,9 @@ async def _call_agent(
     agent = agent_class(
         command=agent_config.command,
         timeout=agent_config.max_timeout,
+        permission_mode=agent_config.permission_mode,
+        allowed_tools=agent_config.allowed_tools,
+        system_prompt=agent_config.system_prompt,
     )
 
     session_manager.get_or_create_session(agent_config.name)

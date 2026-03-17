@@ -79,3 +79,19 @@ export async function registerAgent(agent: {
 export async function toggleAgent(agentName: string): Promise<Agent> {
   return request(`/agents/${agentName}/toggle`, { method: "PATCH" });
 }
+
+export async function updateAgent(
+  agentName: string,
+  fields: {
+    display_name?: string;
+    permission_mode?: string;
+    allowed_tools?: string | null;
+    system_prompt?: string | null;
+    max_timeout?: number;
+  }
+): Promise<Agent> {
+  return request(`/agents/${agentName}`, {
+    method: "PATCH",
+    body: JSON.stringify(fields),
+  });
+}

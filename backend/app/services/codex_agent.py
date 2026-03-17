@@ -32,8 +32,8 @@ _SKIP_PREFIXES = (
 class CodexAgent(CLIAgent):
     """Wrapper for Codex CLI (`codex exec`)."""
 
-    def __init__(self, command: str = "codex", timeout: int = 300):
-        super().__init__(command=command, timeout=timeout)
+    def __init__(self, command: str = "codex", timeout: int = 300, **kwargs):
+        super().__init__(command=command, timeout=timeout, **kwargs)
 
     def build_command(self, message: str, session_id: str | None = None) -> list[str]:
         """Build the codex CLI command.
@@ -41,10 +41,15 @@ class CodexAgent(CLIAgent):
         Example:
             codex exec "say hello"
         """
+        # Prepend system prompt to message if set
+        prompt = message
+        if self.system_prompt:
+            prompt = f"{self.system_prompt}\n\n{message}"
+
         cmd = [
             self.command,
             "exec",
-            message,
+            prompt,
         ]
         return cmd
 

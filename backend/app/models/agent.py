@@ -32,6 +32,15 @@ class AgentConfig(Base):
     max_timeout: Mapped[int] = mapped_column(
         Integer, default=300
     )  # seconds
+    permission_mode: Mapped[str] = mapped_column(
+        String(30), default="acceptEdits"
+    )  # "default", "acceptEdits", "plan", "bypassPermissions"
+    allowed_tools: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )  # 逗号分隔: "Read,Glob,Grep,Edit,Write,Bash" 或 null=全部
+    system_prompt: Mapped[str | None] = mapped_column(
+        Text, nullable=True
+    )  # 人格提示词
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )

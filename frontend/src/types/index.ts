@@ -25,6 +25,9 @@ export interface Agent {
   default_args: string | null;
   enabled: boolean;
   max_timeout: number;
+  permission_mode: string;
+  allowed_tools: string | null;
+  system_prompt: string | null;
   created_at: string;
 }
 

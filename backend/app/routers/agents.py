@@ -4,7 +4,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import get_db
 from app.models.agent import AgentConfig
-from app.schemas.schemas import AgentRegister, AgentResponse, AgentStatusResponse
+from app.schemas.schemas import AgentRegister, AgentResponse, AgentStatusResponse, AgentUpdate
 
 router = APIRouter()
 
@@ -88,6 +88,26 @@ async def get_agent_status(agent_name: str, db: AsyncSession = Depends(get_db)):
         current_session_id=session_id,
         message_count=message_count,
     )
+
+
+@router.patch("/{agent_name}", response_model=AgentResponse)
+async def update_agent(
+    agent_name: str, body: AgentUpdate, db: AsyncSession = Depends(get_db)
+):
+    """Partially update an agent's configuration."""
+    result = await db.execute(
+        select(AgentConfig).where(AgentConfig.name == agent_name)
+    )
+    agent = result.scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+
+    for field, value in body.model_dump(exclude_unset=True).items():
+        setattr(agent, field, value)
+
+    await db.flush()
+    await db.refresh(agent)
+    return agent
 
 
 @router.patch("/{agent_name}/toggle", response_model=AgentResponse)

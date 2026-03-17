@@ -114,13 +114,17 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                         })
 
                     try:
+                        # Map display_name → internal name for status broadcasts
+                        display_to_name = {a.display_name: a.name for a in enabled}
+
                         # on_response callback: broadcast each agent reply as it arrives
                         async def on_agent_response(resp_msg: Message):
                             await manager.broadcast(room_id, message_to_dict(resp_msg))
-                            # Mark this specific agent as idle
+                            # Use internal name (e.g. "claude"), not display_name (e.g. "Claude Code")
+                            internal_name = display_to_name.get(resp_msg.sender_name, resp_msg.sender_name)
                             await manager.broadcast(room_id, {
                                 "type": "status",
-                                "agent_name": resp_msg.sender_name,
+                                "agent_name": internal_name,
                                 "status": "idle",
                             })
 

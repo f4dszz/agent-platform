@@ -1,6 +1,8 @@
-import { useState } from "react";
-import type { Room } from "../types";
+import { useState, useEffect } from "react";
+import type { Room, Agent } from "../types";
+import { listAgents } from "../services/api";
 import { useTheme, t, type ThemeMode, type BubbleStyle } from "./ThemeContext";
+import AgentSettings from "./AgentSettings";
 
 interface RoomSidebarProps {
   rooms: Room[];
@@ -22,6 +24,12 @@ export default function RoomSidebar({
   const [newRoomName, setNewRoomName] = useState("");
   const [showCreate, setShowCreate] = useState(false);
   const [showSettings, setShowSettings] = useState(false);
+  const [agents, setAgents] = useState<Agent[]>([]);
+  const [expandedAgent, setExpandedAgent] = useState<string | null>(null);
+
+  useEffect(() => {
+    listAgents().then(setAgents).catch(console.error);
+  }, []);
 
   const handleCreate = () => {
     const name = newRoomName.trim();
@@ -174,35 +182,56 @@ export default function RoomSidebar({
         {Object.entries(agentStatuses).length === 0 ? (
           <p className={`text-xs ${tk.textDim}`}>No agents registered</p>
         ) : (
-          <div className="space-y-1.5">
-            {Object.entries(agentStatuses).map(([name, status]) => (
-              <div key={name} className="flex items-center gap-2">
-                <div
-                  className={`w-6 h-6 rounded-md flex items-center justify-center text-white text-[10px] font-bold ${
-                    name.includes("claude")
-                      ? "bg-gradient-to-br from-orange-500 to-amber-600"
-                      : "bg-gradient-to-br from-emerald-500 to-green-600"
-                  }`}
-                >
-                  {name.includes("claude") ? "C" : "X"}
-                </div>
-                <span className={`text-xs ${tk.textSecondary} flex-1`}>{name}</span>
-                <div className="flex items-center gap-1.5">
-                  <span
-                    className={`w-1.5 h-1.5 rounded-full ${
-                      status === "working"
-                        ? "bg-yellow-400 animate-pulse shadow-[0_0_4px_rgba(250,204,21,0.5)]"
-                        : status === "idle"
-                          ? "bg-green-400 shadow-[0_0_4px_rgba(74,222,128,0.3)]"
-                          : "bg-gray-600"
+          <div className="space-y-1">
+            {Object.entries(agentStatuses).map(([name, status]) => {
+              const agentData = agents.find((a) => a.name === name);
+              const isExpanded = expandedAgent === name;
+              return (
+                <div key={name}>
+                  <button
+                    onClick={() => setExpandedAgent(isExpanded ? null : name)}
+                    className={`w-full flex items-center gap-2 px-1 py-1 rounded-lg transition-colors ${
+                      isExpanded ? tk.sidebarActive : tk.sidebarHover
                     }`}
-                  />
-                  <span className={`text-[10px] ${tk.textMuted}`}>
-                    {status === "working" ? "working" : status === "idle" ? "online" : "offline"}
-                  </span>
+                  >
+                    <div
+                      className={`w-6 h-6 rounded-md flex items-center justify-center text-white text-[10px] font-bold shrink-0 ${
+                        name.includes("claude")
+                          ? "bg-gradient-to-br from-orange-500 to-amber-600"
+                          : "bg-gradient-to-br from-emerald-500 to-green-600"
+                      }`}
+                    >
+                      {name.includes("claude") ? "C" : "X"}
+                    </div>
+                    <span className={`text-xs ${tk.textSecondary} flex-1 text-left`}>{name}</span>
+                    <div className="flex items-center gap-1.5">
+                      <span
+                        className={`w-1.5 h-1.5 rounded-full ${
+                          status === "working"
+                            ? "bg-yellow-400 animate-pulse shadow-[0_0_4px_rgba(250,204,21,0.5)]"
+                            : status === "idle"
+                              ? "bg-green-400 shadow-[0_0_4px_rgba(74,222,128,0.3)]"
+                              : "bg-gray-600"
+                        }`}
+                      />
+                      <span className={`text-[10px] ${tk.textMuted}`}>
+                        {status === "working" ? "working" : status === "idle" ? "online" : "offline"}
+                      </span>
+                    </div>
+                  </button>
+                  {isExpanded && agentData && (
+                    <AgentSettings
+                      agent={agentData}
+                      onUpdated={(updated) =>
+                        setAgents((prev) =>
+                          prev.map((a) => (a.name === updated.name ? updated : a))
+                        )
+                      }
+                    />
+                  )}
                 </div>
-              </div>
-            ))}
+              );
+            })}
           </div>
         )}
       </div>

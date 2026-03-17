@@ -18,9 +18,19 @@ IS_WINDOWS = sys.platform == "win32"
 class CLIAgent(ABC):
     """Base class for spawning CLI agents as subprocesses."""
 
-    def __init__(self, command: str, timeout: int = 300):
+    def __init__(
+        self,
+        command: str,
+        timeout: int = 300,
+        permission_mode: str = "acceptEdits",
+        allowed_tools: str | None = None,
+        system_prompt: str | None = None,
+    ):
         self.command = command
         self.timeout = timeout
+        self.permission_mode = permission_mode
+        self.allowed_tools = allowed_tools
+        self.system_prompt = system_prompt
 
     @abstractmethod
     def build_command(self, message: str, session_id: str | None = None) -> list[str]:

@@ -22,6 +22,9 @@ DEFAULT_AGENTS = [
         "agent_type": "claude",
         "command": "claude",
         "max_timeout": 300,
+        "permission_mode": "acceptEdits",
+        "allowed_tools": None,
+        "system_prompt": None,
     },
     {
         "name": "codex",
@@ -29,6 +32,9 @@ DEFAULT_AGENTS = [
         "agent_type": "codex",
         "command": "codex",
         "max_timeout": 300,
+        "permission_mode": "default",
+        "allowed_tools": None,
+        "system_prompt": None,
     },
 ]
 
