@@ -1,5 +1,7 @@
 # Agent Platform
 
+My multi-agent working chatroom/platform.
+
 A multi-agent chat platform that orchestrates CLI-based AI agents (Claude Code, Codex CLI, etc.) through a web/mobile interface.
 
 ## Features (Planned)
