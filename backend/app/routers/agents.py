@@ -26,6 +26,9 @@ async def register_agent(body: AgentRegister, db: AsyncSession = Depends(get_db)
         command=body.command,
         default_args=body.default_args,
         max_timeout=body.max_timeout,
+        permission_mode=body.permission_mode,
+        allowed_tools=body.allowed_tools,
+        system_prompt=body.system_prompt,
     )
     db.add(agent)
     await db.flush()
