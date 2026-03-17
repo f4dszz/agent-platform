@@ -27,6 +27,7 @@ class ClaudeAgent(CLIAgent):
             self.command,
             "-p",
             "--output-format", "json",
+            "--dangerously-skip-permissions",
         ]
 
         if session_id:
