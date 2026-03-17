@@ -7,6 +7,15 @@ interface UseWebSocketOptions {
   reconnectInterval?: number;
 }
 
+/** Detach all event handlers and close a WebSocket. */
+function killSocket(ws: WebSocket) {
+  ws.onopen = null;
+  ws.onmessage = null;
+  ws.onerror = null;
+  ws.onclose = null;
+  ws.close();
+}
+
 export function useWebSocket({
   roomId,
   onMessage,
@@ -15,7 +24,6 @@ export function useWebSocket({
   const [connected, setConnected] = useState(false);
   const wsRef = useRef<WebSocket | null>(null);
   const reconnectTimer = useRef<ReturnType<typeof setTimeout>>();
-  // Use refs to hold latest callbacks without triggering reconnects
   const onMessageRef = useRef(onMessage);
   onMessageRef.current = onMessage;
 
@@ -27,29 +35,27 @@ export function useWebSocket({
     function connect() {
       if (disposed) return;
 
-      // Close any existing connection first
+      // Kill any lingering connection
       if (wsRef.current) {
-        wsRef.current.onclose = null; // prevent reconnect on intentional close
-        wsRef.current.close();
+        killSocket(wsRef.current);
         wsRef.current = null;
       }
 
       const protocol = window.location.protocol === "https:" ? "wss:" : "ws:";
       const wsUrl = `${protocol}//${window.location.host}/ws/${roomId}`;
-
       const ws = new WebSocket(wsUrl);
       wsRef.current = ws;
 
       ws.onopen = () => {
         if (disposed) {
-          ws.close();
+          killSocket(ws);
           return;
         }
         setConnected(true);
-        console.log(`[WS] Connected to room ${roomId}`);
       };
 
       ws.onmessage = (event) => {
+        if (disposed) return;
         try {
           const data: WSIncomingMessage = JSON.parse(event.data);
           onMessageRef.current?.(data);
@@ -61,14 +67,10 @@ export function useWebSocket({
       ws.onclose = () => {
         if (disposed) return;
         setConnected(false);
-        console.log("[WS] Disconnected, reconnecting...");
         reconnectTimer.current = setTimeout(connect, reconnectInterval);
       };
 
-      ws.onerror = (err) => {
-        console.error("[WS] Error:", err);
-        ws.close();
-      };
+      ws.onerror = () => ws.close();
     }
 
     connect();
@@ -77,8 +79,7 @@ export function useWebSocket({
       disposed = true;
       clearTimeout(reconnectTimer.current);
       if (wsRef.current) {
-        wsRef.current.onclose = null;
-        wsRef.current.close();
+        killSocket(wsRef.current);
         wsRef.current = null;
       }
       setConnected(false);
@@ -88,8 +89,6 @@ export function useWebSocket({
   const send = useCallback((msg: WSOutgoingMessage) => {
     if (wsRef.current?.readyState === WebSocket.OPEN) {
       wsRef.current.send(JSON.stringify(msg));
-    } else {
-      console.warn("[WS] Cannot send — not connected");
     }
   }, []);
 

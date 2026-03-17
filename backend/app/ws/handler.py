@@ -1,18 +1,13 @@
-"""WebSocket handler — real-time message broadcasting.
-
-Manages WebSocket connections per room and integrates with the orchestrator
-to route messages and broadcast responses.
-"""
+"""WebSocket handler — real-time message broadcasting."""
 
 import json
 import logging
-from datetime import datetime, timezone
 
 from fastapi import APIRouter, WebSocket, WebSocketDisconnect
 
 from app.db.database import async_session
 from app.models.message import Message
-from app.services.orchestrator import route_message
+from app.services.orchestrator import route_message, extract_mentions, get_enabled_agents
 
 logger = logging.getLogger(__name__)
 
@@ -20,67 +15,40 @@ router = APIRouter()
 
 
 class ConnectionManager:
-    """Manages WebSocket connections grouped by room."""
-
     def __init__(self):
-        # room_id → set of connected WebSockets
         self._rooms: dict[str, set[WebSocket]] = {}
 
     async def connect(self, websocket: WebSocket, room_id: str) -> None:
-        """Accept a WebSocket connection and add it to a room."""
         await websocket.accept()
         if room_id not in self._rooms:
             self._rooms[room_id] = set()
         self._rooms[room_id].add(websocket)
-        logger.info(
-            f"Client connected to room {room_id} "
-            f"(total: {len(self._rooms[room_id])})"
-        )
+        logger.info(f"WS connect room={room_id} total={len(self._rooms[room_id])}")
 
     def disconnect(self, websocket: WebSocket, room_id: str) -> None:
-        """Remove a WebSocket from a room."""
         if room_id in self._rooms:
             self._rooms[room_id].discard(websocket)
             if not self._rooms[room_id]:
                 del self._rooms[room_id]
-            logger.info(f"Client disconnected from room {room_id}")
 
     async def broadcast(self, room_id: str, data: dict) -> None:
-        """Send a JSON message to all clients in a room."""
         if room_id not in self._rooms:
             return
-
         payload = json.dumps(data)
-        dead_connections = set()
-
+        dead = set()
         for ws in self._rooms[room_id]:
             try:
                 await ws.send_text(payload)
             except Exception:
-                dead_connections.add(ws)
-
-        # Clean up dead connections
-        for ws in dead_connections:
+                dead.add(ws)
+        for ws in dead:
             self._rooms[room_id].discard(ws)
 
-    async def send_to(self, websocket: WebSocket, data: dict) -> None:
-        """Send a JSON message to a specific client."""
-        try:
-            await websocket.send_text(json.dumps(data))
-        except Exception:
-            logger.warning("Failed to send message to client")
 
-    def get_room_count(self, room_id: str) -> int:
-        """Get the number of connected clients in a room."""
-        return len(self._rooms.get(room_id, set()))
-
-
-# Singleton connection manager
 manager = ConnectionManager()
 
 
 def message_to_dict(msg: Message) -> dict:
-    """Convert a Message ORM object to a dict for WebSocket broadcast."""
     return {
         "type": "chat",
         "id": msg.id,
@@ -94,41 +62,24 @@ def message_to_dict(msg: Message) -> dict:
 
 @router.websocket("/ws/{room_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str):
-    """WebSocket endpoint for real-time chat in a room.
-
-    Protocol:
-      Client sends: {"type": "chat", "sender_name": "User", "content": "Hello @claude"}
-      Server broadcasts: {"type": "chat", "id": "...", "sender_type": "human", ...}
-      Server broadcasts: {"type": "status", "agent_name": "claude", "status": "working"}
-      Server broadcasts: {"type": "chat", "id": "...", "sender_type": "claude", ...}
-      Server broadcasts: {"type": "status", "agent_name": "claude", "status": "idle"}
-    """
     await manager.connect(websocket, room_id)
 
     try:
         while True:
-            # Receive message from client
             raw = await websocket.receive_text()
             try:
                 data = json.loads(raw)
             except json.JSONDecodeError:
-                await manager.send_to(websocket, {
-                    "type": "error",
-                    "content": "Invalid JSON",
-                })
                 continue
 
-            msg_type = data.get("type", "chat")
-
-            if msg_type == "chat":
+            if data.get("type") == "chat":
                 sender_name = data.get("sender_name", "User")
                 content = data.get("content", "").strip()
-
                 if not content:
                     continue
 
-                # Save human message to DB
                 async with async_session() as db:
+                    # Save & broadcast human message
                     message = Message(
                         room_id=room_id,
                         sender_type="human",
@@ -138,55 +89,68 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                     db.add(message)
                     await db.commit()
                     await db.refresh(message)
-
-                    # Broadcast human message to all clients
                     await manager.broadcast(room_id, message_to_dict(message))
 
-                    # Route to agents via orchestrator
-                    from app.services.orchestrator import extract_mentions
-
+                    # Determine mentioned agents
                     mentions = extract_mentions(content)
-                    if mentions:
-                        for mention in mentions:
+                    if not mentions:
+                        continue
+
+                    # Resolve which actual agent names are targeted
+                    enabled = await get_enabled_agents(db)
+                    agent_names = set()
+                    if "all" in mentions:
+                        agent_names = {a.name for a in enabled}
+                    else:
+                        enabled_map = {a.name.lower() for a in enabled}
+                        agent_names = {m for m in mentions if m in enabled_map}
+
+                    # Broadcast "working" for each real agent
+                    for name in agent_names:
+                        await manager.broadcast(room_id, {
+                            "type": "status",
+                            "agent_name": name,
+                            "status": "working",
+                        })
+
+                    try:
+                        # on_response callback: broadcast each agent reply as it arrives
+                        async def on_agent_response(resp_msg: Message):
+                            await manager.broadcast(room_id, message_to_dict(resp_msg))
+                            # Mark this specific agent as idle
                             await manager.broadcast(room_id, {
                                 "type": "status",
-                                "agent_name": mention,
-                                "status": "working",
+                                "agent_name": resp_msg.sender_name,
+                                "status": "idle",
                             })
 
-                        try:
-                            # Get agent responses
-                            agent_responses = await route_message(message, db)
-                            await db.commit()
-
-                            # Broadcast each agent response
-                            for resp in agent_responses:
-                                await manager.broadcast(room_id, message_to_dict(resp))
-                        except Exception as e:
-                            logger.error(f"Agent routing error: {e}", exc_info=True)
+                        await route_message(message, db, on_response=on_agent_response)
+                        await db.commit()
+                    except Exception as e:
+                        logger.error(f"Agent routing error: {e}", exc_info=True)
+                        await manager.broadcast(room_id, {
+                            "type": "chat",
+                            "id": "",
+                            "room_id": room_id,
+                            "sender_type": "system",
+                            "sender_name": "System",
+                            "content": f"Agent error: {e}",
+                            "created_at": None,
+                        })
+                    finally:
+                        # Ensure all agents marked idle
+                        for name in agent_names:
                             await manager.broadcast(room_id, {
-                                "type": "chat",
-                                "id": "",
-                                "room_id": room_id,
-                                "sender_type": "system",
-                                "sender_name": "System",
-                                "content": f"Agent error: {e}",
-                                "created_at": None,
+                                "type": "status",
+                                "agent_name": name,
+                                "status": "idle",
                             })
-                        finally:
-                            # Always broadcast "idle" status
-                            for mention in mentions:
-                                await manager.broadcast(room_id, {
-                                    "type": "status",
-                                    "agent_name": mention,
-                                    "status": "idle",
-                                })
 
-            elif msg_type == "ping":
-                await manager.send_to(websocket, {"type": "pong"})
+            elif data.get("type") == "ping":
+                await websocket.send_text(json.dumps({"type": "pong"}))
 
     except WebSocketDisconnect:
         manager.disconnect(websocket, room_id)
     except Exception as e:
-        logger.error(f"WebSocket error: {e}")
+        logger.error(f"WebSocket error: {e}", exc_info=True)
         manager.disconnect(websocket, room_id)

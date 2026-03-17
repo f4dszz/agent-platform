@@ -50,14 +50,16 @@ export default function App() {
             onAgentStatusChange={setAgentStatuses}
           />
         ) : (
-          <div className="flex-1 flex items-center justify-center text-gray-500">
+          <div className="flex-1 flex items-center justify-center text-gray-500 bg-gray-900">
             <div className="text-center">
-              <p className="text-4xl mb-4">💬</p>
-              <p className="text-lg">Select or create a room to start chatting</p>
-              <p className="text-sm mt-2">
-                Use <code className="bg-gray-800 px-1 rounded">@claude</code> or{" "}
-                <code className="bg-gray-800 px-1 rounded">@codex</code> to talk to
-                agents
+              <div className="text-5xl mb-5 opacity-40">💬</div>
+              <p className="text-lg font-medium text-gray-400">Select or create a room</p>
+              <p className="text-sm mt-2 text-gray-600">
+                Use{" "}
+                <code className="bg-gray-800 px-1.5 py-0.5 rounded text-xs text-orange-400">@claude</code>{" "}
+                or{" "}
+                <code className="bg-gray-800 px-1.5 py-0.5 rounded text-xs text-emerald-400">@codex</code>{" "}
+                to talk to agents
               </p>
             </div>
           </div>

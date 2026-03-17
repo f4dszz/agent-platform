@@ -20,8 +20,8 @@ export default function ChatRoom({
 }: ChatRoomProps) {
   const [messages, setMessages] = useState<Message[]>([]);
   const [agents, setAgents] = useState<Agent[]>([]);
+  const [typingAgents, setTypingAgents] = useState<string[]>([]);
 
-  // Load history on room change
   useEffect(() => {
     let cancelled = false;
     listMessages(roomId).then((data) => {
@@ -35,13 +35,11 @@ export default function ChatRoom({
     };
   }, [roomId]);
 
-  // Handle incoming WebSocket messages
   const handleWSMessage = useCallback(
     (msg: WSIncomingMessage) => {
       switch (msg.type) {
         case "chat":
           setMessages((prev) => {
-            // Deduplicate by message ID
             if (msg.id && prev.some((m) => m.id === msg.id)) return prev;
             return [
               ...prev,
@@ -57,19 +55,37 @@ export default function ChatRoom({
           });
           break;
 
-        case "status":
-          onAgentStatusChange((prev) => ({
-            ...prev,
-            [msg.agent_name]: msg.status,
-          }));
+        case "status": {
+          const name = msg.agent_name;
+          const status = msg.status;
+
+          onAgentStatusChange((prev) => ({ ...prev, [name]: status }));
+
+          if (status === "working") {
+            // Find display name for the agent
+            const displayName =
+              agents.find((a) => a.name === name)?.display_name ?? name;
+            setTypingAgents((prev) =>
+              prev.includes(displayName) ? prev : [...prev, displayName]
+            );
+          } else {
+            // Remove from typing (match by agent name or display name)
+            setTypingAgents((prev) =>
+              prev.filter((n) => {
+                const a = agents.find((ag) => ag.display_name === n);
+                return a ? a.name !== name : n !== name;
+              })
+            );
+          }
           break;
+        }
 
         case "error":
           console.error("[Chat] Server error:", msg.content);
           break;
       }
     },
-    [onAgentStatusChange]
+    [onAgentStatusChange, agents]
   );
 
   const { connected, send } = useWebSocket({
@@ -78,34 +94,33 @@ export default function ChatRoom({
   });
 
   const handleSend = (content: string) => {
-    send({
-      type: "chat",
-      sender_name: "User",
-      content,
-    });
+    send({ type: "chat", sender_name: "User", content });
   };
 
   return (
-    <div className="flex flex-col h-full">
+    <div className="flex flex-col h-full bg-gray-850">
       {/* Room header */}
-      <div className="px-4 py-3 border-b border-gray-700 bg-gray-800 flex items-center justify-between">
-        <div>
-          <h2 className="text-white font-semibold"># {roomName}</h2>
+      <div className="px-5 py-3.5 border-b border-gray-700/50 bg-gray-800/80 backdrop-blur flex items-center justify-between">
+        <div className="flex items-center gap-2.5">
+          <div className="w-8 h-8 rounded-lg bg-gradient-to-br from-violet-500 to-purple-600 flex items-center justify-center text-white text-sm font-bold shadow-sm">
+            #
+          </div>
+          <h2 className="text-white font-semibold text-sm">{roomName}</h2>
         </div>
         <div className="flex items-center gap-2">
           <span
-            className={`w-2 h-2 rounded-full ${
-              connected ? "bg-green-400" : "bg-red-400"
+            className={`w-2 h-2 rounded-full transition-colors ${
+              connected ? "bg-green-400 shadow-[0_0_6px_rgba(74,222,128,0.4)]" : "bg-red-400"
             }`}
           />
-          <span className="text-xs text-gray-400">
+          <span className="text-xs text-gray-500">
             {connected ? "Connected" : "Reconnecting..."}
           </span>
         </div>
       </div>
 
       {/* Messages */}
-      <MessageList messages={messages} />
+      <MessageList messages={messages} typingAgents={typingAgents} />
 
       {/* Input */}
       <MessageInput
