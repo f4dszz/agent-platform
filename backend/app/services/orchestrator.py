@@ -45,6 +45,35 @@ async def get_enabled_agents(db: AsyncSession) -> list[AgentConfig]:
     return list(result.scalars().all())
 
 
+async def _build_prompt_with_history(
+    db: AsyncSession,
+    room_id: str,
+    current_content: str,
+    max_messages: int = 20,
+) -> str:
+    """Prepend recent chat history so the agent can see prior conversation."""
+    result = await db.execute(
+        select(Message)
+        .where(Message.room_id == room_id)
+        .order_by(Message.created_at.desc())
+        .limit(max_messages)
+    )
+    history = list(result.scalars().all())
+    history.reverse()  # chronological order
+
+    if not history:
+        return current_content
+
+    lines = ["[Chat History]"]
+    for msg in history:
+        lines.append(f"{msg.sender_name}: {msg.content}")
+    lines.append("")
+    lines.append("[Current Request]")
+    lines.append(current_content)
+
+    return "\n".join(lines)
+
+
 async def _call_agent(
     agent_config: AgentConfig, prompt: str
 ) -> tuple[AgentConfig, str]:
@@ -113,8 +142,13 @@ async def route_message(
     if not targets:
         return []
 
+    # Build prompt with chat history so agent can see prior conversation
+    prompt_with_history = await _build_prompt_with_history(
+        db, message.room_id, clean_content
+    )
+
     # Call all agents in parallel
-    tasks = [_call_agent(cfg, clean_content) for cfg in targets]
+    tasks = [_call_agent(cfg, prompt_with_history) for cfg in targets]
     results = await asyncio.gather(*tasks, return_exceptions=True)
 
     responses: list[Message] = []
