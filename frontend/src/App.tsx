@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import type { Room } from "./types";
-import { listRooms, createRoom } from "./services/api";
+import { listRooms, createRoom, listAgents } from "./services/api";
 import { ThemeProvider, useTheme, t } from "./components/ThemeContext";
 import RoomSidebar from "./components/RoomSidebar";
 import ChatRoom from "./components/ChatRoom";
@@ -20,6 +20,13 @@ function AppInner() {
       if (data.rooms.length > 0) {
         setSelectedRoomId((prev) => prev ?? data.rooms[0].id);
       }
+    });
+    listAgents().then((agents) => {
+      const initial: Record<string, "idle" | "working" | "offline"> = {};
+      for (const a of agents) {
+        initial[a.name] = a.enabled ? "idle" : "offline";
+      }
+      setAgentStatuses(initial);
     });
   }, []);
 
