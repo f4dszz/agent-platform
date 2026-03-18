@@ -49,12 +49,14 @@ async def _build_prompt_with_history(
     db: AsyncSession,
     room_id: str,
     current_content: str,
+    current_message_id: str,
     max_messages: int = 20,
 ) -> str:
     """Prepend recent chat history so the agent can see prior conversation."""
     result = await db.execute(
         select(Message)
         .where(Message.room_id == room_id)
+        .where(Message.id != current_message_id)  # exclude current msg to avoid duplication
         .order_by(Message.created_at.desc())
         .limit(max_messages)
     )
@@ -144,7 +146,7 @@ async def route_message(
 
     # Build prompt with chat history so agent can see prior conversation
     prompt_with_history = await _build_prompt_with_history(
-        db, message.room_id, clean_content
+        db, message.room_id, clean_content, message.id
     )
 
     # Call all agents in parallel
