@@ -32,7 +32,7 @@ DEFAULT_AGENTS = [
         "agent_type": "codex",
         "command": "codex",
         "max_timeout": 300,
-        "permission_mode": "default",
+        "permission_mode": "acceptEdits",
         "allowed_tools": None,
         "system_prompt": None,
     },

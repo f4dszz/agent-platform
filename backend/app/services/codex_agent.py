@@ -35,20 +35,31 @@ class CodexAgent(CLIAgent):
     def __init__(self, command: str = "codex", timeout: int = 300, **kwargs):
         super().__init__(command=command, timeout=timeout, **kwargs)
 
+    # Map platform permission_mode → codex --sandbox value
+    _SANDBOX_MAP = {
+        "acceptEdits": "workspace-write",
+        "bypassPermissions": "danger-full-access",
+        "plan": "read-only",
+        "default": "read-only",
+    }
+
     def build_command(self, message: str, session_id: str | None = None) -> list[str]:
         """Build the codex CLI command.
 
         Example:
-            codex exec "say hello"
+            codex exec --sandbox workspace-write "say hello"
         """
         # Prepend system prompt to message if set
         prompt = message
         if self.system_prompt:
             prompt = f"{self.system_prompt}\n\n{message}"
 
+        sandbox = self._SANDBOX_MAP.get(self.permission_mode, "read-only")
+
         cmd = [
             self.command,
             "exec",
+            "--sandbox", sandbox,
             prompt,
         ]
         return cmd
