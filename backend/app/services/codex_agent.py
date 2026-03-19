@@ -130,3 +130,25 @@ class CodexAgent(CLIAgent):
             filtered.pop()
 
         return "\n".join(filtered).strip() if filtered else raw.strip()
+
+    def build_stream_preview(self, raw: str) -> str | None:
+        """Extract the current assistant response from partial Codex output."""
+        if not raw.strip():
+            return ""
+
+        lines = raw.splitlines()
+        codex_idx = None
+        for i, line in enumerate(lines):
+            if line.strip() == "codex":
+                codex_idx = i
+
+        if codex_idx is None:
+            return ""
+
+        preview_lines: list[str] = []
+        for line in lines[codex_idx + 1 :]:
+            if line.strip() == "tokens used":
+                break
+            preview_lines.append(line)
+
+        return "\n".join(preview_lines).rstrip()

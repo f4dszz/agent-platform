@@ -11,6 +11,8 @@ import asyncio
 import logging
 import re
 import subprocess
+import uuid
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Awaitable, Callable
 
@@ -49,6 +51,7 @@ Rules for collaboration:
 """.strip()
 
 StatusCallback = Callable[[str, str], Awaitable[None]]
+StreamCallback = Callable[[Message, str], Awaitable[None]]
 
 AGENT_CLASSES = {
     "claude": ClaudeAgent,
@@ -272,7 +275,9 @@ async def _build_prompt_with_history(
 
 
 async def _call_agent(
-    agent_config: AgentConfig, prompt: str
+    agent_config: AgentConfig,
+    prompt: str,
+    on_stream: Callable[[str], Awaitable[None]] | None = None,
 ) -> tuple[AgentConfig, str]:
     """Call a single agent and return (config, response_text)."""
     agent_class = AGENT_CLASSES.get(agent_config.agent_type)
@@ -298,7 +303,14 @@ async def _call_agent(
     session_manager.start_run(agent_config.name)
 
     try:
-        response_text = await agent.send(prompt, session_id=provider_session_id)
+        if on_stream:
+            response_text = await agent.send_with_stream(
+                prompt,
+                on_stream,
+                session_id=provider_session_id,
+            )
+        else:
+            response_text = await agent.send(prompt, session_id=provider_session_id)
         if agent.last_session_id:
             session_manager.set_provider_session_id(
                 agent_config.name, agent.last_session_id
@@ -321,14 +333,41 @@ async def _run_agent_call(
     agent_config: AgentConfig,
     prompt: str,
     on_status: StatusCallback | None = None,
+    stream_message: Message | None = None,
+    on_stream: StreamCallback | None = None,
 ) -> tuple[AgentConfig, str]:
     if on_status:
         await on_status(agent_config.name, "working")
+
+    async def handle_stream(content: str) -> None:
+        if on_stream and stream_message:
+            await on_stream(stream_message, content)
+
     try:
+        if on_stream and stream_message:
+            return await _call_agent(
+                agent_config,
+                prompt,
+                on_stream=handle_stream,
+            )
         return await _call_agent(agent_config, prompt)
     finally:
         if on_status:
             await on_status(agent_config.name, "idle")
+
+
+def _build_transient_agent_message(
+    room_id: str,
+    agent_config: AgentConfig,
+) -> Message:
+    return Message(
+        id=str(uuid.uuid4()),
+        room_id=room_id,
+        sender_type=agent_config.agent_type,
+        sender_name=agent_config.display_name,
+        content="",
+        created_at=datetime.now(timezone.utc),
+    )
 
 
 def _get_git_context() -> str:
@@ -399,6 +438,7 @@ async def route_message(
     db: AsyncSession,
     on_response=None,
     on_status: StatusCallback | None = None,
+    on_stream: StreamCallback | None = None,
     chain_depth: int = 0,
     agent_chain: tuple[str, ...] = (),
 ) -> list[Message]:
@@ -410,6 +450,7 @@ async def route_message(
         on_response: Optional async callback(Message) called as each agent responds
                      (for real-time broadcast before all agents finish).
         on_status: Optional async callback(agent_name, status) for status updates.
+        on_stream: Optional async callback(Message, content) for progressive chunks.
         chain_depth: Current recursive depth for agent-to-agent chaining.
         agent_chain: Ordered names of agents already invoked in this route chain.
     """
@@ -485,26 +526,42 @@ async def route_message(
     )
 
     responses: list[Message] = []
+
+    async def run_target(
+        cfg: AgentConfig,
+        transient_message: Message,
+    ) -> tuple[Message, AgentConfig, str]:
+        try:
+            agent_config, response_text = await _run_agent_call(
+                cfg,
+                prompt_with_history,
+                on_status,
+                stream_message=transient_message,
+                on_stream=on_stream,
+            )
+        except Exception as e:
+            logger.error("Agent call failed for %s: %s", cfg.name, e)
+            agent_config = cfg
+            response_text = f"Agent error: {e}"
+        return transient_message, agent_config, response_text
+
     tasks = [
-        asyncio.create_task(_run_agent_call(cfg, prompt_with_history, on_status))
+        asyncio.create_task(run_target(cfg, _build_transient_agent_message(message.room_id, cfg)))
         for cfg in targets
     ]
     for task in asyncio.as_completed(tasks):
-        try:
-            agent_config, response_text = await task
-        except Exception as e:
-            logger.error(f"Agent call failed: {e}")
-            continue
+        transient_message, agent_config, response_text = await task
 
         agent_message = Message(
+            id=transient_message.id,
             room_id=message.room_id,
             sender_type=agent_config.agent_type,
             sender_name=agent_config.display_name,
             content=response_text,
+            created_at=transient_message.created_at,
         )
         db.add(agent_message)
         await db.flush()
-        await db.refresh(agent_message)
         responses.append(agent_message)
 
         # Stream each response to clients as it arrives
@@ -517,11 +574,17 @@ async def route_message(
                 agent_config,
                 response_text,
             )
+            review_transient_message = _build_transient_agent_message(
+                message.room_id,
+                reviewer_config,
+            )
             try:
                 _, review_text = await _run_agent_call(
                     reviewer_config,
                     review_prompt,
                     on_status,
+                    stream_message=review_transient_message,
+                    on_stream=on_stream,
                 )
             except Exception as e:
                 logger.error(
@@ -530,17 +593,31 @@ async def route_message(
                     agent_config.name,
                     e,
                 )
+                review_message = Message(
+                    id=review_transient_message.id,
+                    room_id=review_transient_message.room_id,
+                    sender_type=review_transient_message.sender_type,
+                    sender_name=review_transient_message.sender_name,
+                    content=f"Agent error: {e}",
+                    created_at=review_transient_message.created_at,
+                )
+                db.add(review_message)
+                await db.flush()
+                responses.append(review_message)
+                if on_response:
+                    await on_response(review_message)
                 continue
 
             review_message = Message(
+                id=review_transient_message.id,
                 room_id=message.room_id,
                 sender_type=reviewer_config.agent_type,
                 sender_name=reviewer_config.display_name,
                 content=review_text,
+                created_at=review_transient_message.created_at,
             )
             db.add(review_message)
             await db.flush()
-            await db.refresh(review_message)
             responses.append(review_message)
 
             if on_response:
@@ -556,6 +633,7 @@ async def route_message(
             db,
             on_response=on_response,
             on_status=on_status,
+            on_stream=on_stream,
             chain_depth=chain_depth + 1,
             agent_chain=chained_agents,
         )

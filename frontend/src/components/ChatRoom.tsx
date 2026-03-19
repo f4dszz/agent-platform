@@ -25,6 +25,16 @@ export default function ChatRoom({
   const [agents, setAgents] = useState<Agent[]>([]);
   const [typingAgents, setTypingAgents] = useState<string[]>([]);
 
+  const removeTypingAgent = useCallback((identifier: string) => {
+    setTypingAgents((prev) =>
+      prev.filter((displayName) => {
+        const agent = agents.find((candidate) => candidate.display_name === displayName);
+        if (displayName === identifier) return false;
+        return agent ? agent.name !== identifier : true;
+      })
+    );
+  }, [agents]);
+
   useEffect(() => {
     let cancelled = false;
     listMessages(roomId).then((data) => {
@@ -43,7 +53,20 @@ export default function ChatRoom({
       switch (msg.type) {
         case "chat":
           setMessages((prev) => {
-            if (msg.id && prev.some((m) => m.id === msg.id)) return prev;
+            const existingIndex = prev.findIndex((m) => m.id === msg.id);
+            if (existingIndex >= 0) {
+              const next = [...prev];
+              next[existingIndex] = {
+                ...next[existingIndex],
+                room_id: msg.room_id,
+                sender_type: msg.sender_type as Message["sender_type"],
+                sender_name: msg.sender_name,
+                content: msg.content,
+                created_at: msg.created_at,
+                streaming: false,
+              };
+              return next;
+            }
             return [
               ...prev,
               {
@@ -53,6 +76,39 @@ export default function ChatRoom({
                 sender_name: msg.sender_name,
                 content: msg.content,
                 created_at: msg.created_at,
+                streaming: false,
+              },
+            ];
+          });
+          break;
+
+        case "stream_chunk":
+          removeTypingAgent(msg.sender_name);
+          setMessages((prev) => {
+            const existingIndex = prev.findIndex((m) => m.id === msg.id);
+            if (existingIndex >= 0) {
+              const next = [...prev];
+              next[existingIndex] = {
+                ...next[existingIndex],
+                room_id: msg.room_id,
+                sender_type: msg.sender_type as Message["sender_type"],
+                sender_name: msg.sender_name,
+                content: msg.content,
+                created_at: msg.created_at,
+                streaming: true,
+              };
+              return next;
+            }
+            return [
+              ...prev,
+              {
+                id: msg.id,
+                room_id: msg.room_id,
+                sender_type: msg.sender_type as Message["sender_type"],
+                sender_name: msg.sender_name,
+                content: msg.content,
+                created_at: msg.created_at,
+                streaming: true,
               },
             ];
           });
@@ -72,13 +128,7 @@ export default function ChatRoom({
               prev.includes(displayName) ? prev : [...prev, displayName]
             );
           } else {
-            // Remove from typing (match by agent name or display name)
-            setTypingAgents((prev) =>
-              prev.filter((n) => {
-                const a = agents.find((ag) => ag.display_name === n);
-                return a ? a.name !== name : n !== name;
-              })
-            );
+            removeTypingAgent(name);
           }
           break;
         }
@@ -88,7 +138,7 @@ export default function ChatRoom({
           break;
       }
     },
-    [onAgentStatusChange, agents]
+    [onAgentStatusChange, agents, removeTypingAgent]
   );
 
   const { connected, send } = useWebSocket({

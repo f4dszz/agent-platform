@@ -14,6 +14,7 @@ export interface Message {
   sender_name: string;
   content: string;
   created_at: string;
+  streaming?: boolean;
 }
 
 export interface Agent {
@@ -50,6 +51,16 @@ export interface WSChatMessage {
   created_at: string;
 }
 
+export interface WSStreamChunkMessage {
+  type: "stream_chunk";
+  id: string;
+  room_id: string;
+  sender_type: string;
+  sender_name: string;
+  content: string;
+  created_at: string;
+}
+
 export interface WSStatusMessage {
   type: "status";
   agent_name: string;
@@ -63,6 +74,7 @@ export interface WSErrorMessage {
 
 export type WSIncomingMessage =
   | WSChatMessage
+  | WSStreamChunkMessage
   | WSStatusMessage
   | WSErrorMessage;
 

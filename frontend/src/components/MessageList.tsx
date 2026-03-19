@@ -1,4 +1,4 @@
-import { useRef, useEffect } from "react";
+import { useRef, useEffect, useState } from "react";
 import type { Message } from "../types";
 import { useTheme, t, bubbleClasses } from "./ThemeContext";
 import MarkdownContent from "./MarkdownContent";
@@ -7,6 +7,9 @@ interface MessageListProps {
   messages: Message[];
   typingAgents: string[];
 }
+
+const MAX_COLLAPSED_LINES = 24;
+const MAX_COLLAPSED_CHARS = 1800;
 
 function senderAvatar(senderType: string): string {
   switch (senderType) {
@@ -39,6 +42,7 @@ export default function MessageList({ messages, typingAgents }: MessageListProps
   const { mode, bubbleStyle } = useTheme();
   const tk = t(mode);
   const bottomRef = useRef<HTMLDivElement>(null);
+  const [expandedMessages, setExpandedMessages] = useState<Record<string, boolean>>({});
 
   useEffect(() => {
     bottomRef.current?.scrollIntoView({ behavior: "smooth" });
@@ -64,6 +68,11 @@ export default function MessageList({ messages, typingAgents }: MessageListProps
       {messages.map((msg) => {
         const isHuman = msg.sender_type === "human";
         const bubble = bubbleClasses(msg.sender_type, bubbleStyle, mode);
+        const lineCount = msg.content.split("\n").length;
+        const shouldCollapse =
+          !msg.streaming &&
+          (lineCount > MAX_COLLAPSED_LINES || msg.content.length > MAX_COLLAPSED_CHARS);
+        const expanded = expandedMessages[msg.id] ?? false;
 
         return (
           <div
@@ -84,8 +93,50 @@ export default function MessageList({ messages, typingAgents }: MessageListProps
                 <span className={`text-[10px] ${tk.textDim} opacity-0 group-hover:opacity-100 transition-opacity`}>
                   {new Date(msg.created_at).toLocaleTimeString()}
                 </span>
+                {msg.streaming ? (
+                  <span className={`text-[10px] ${tk.textMuted} animate-pulse`}>
+                    streaming...
+                  </span>
+                ) : null}
               </div>
-              <MarkdownContent content={msg.content} />
+              <div className={shouldCollapse && !expanded ? "relative" : ""}>
+                <div
+                  className={
+                    shouldCollapse && !expanded
+                      ? "max-h-[28rem] overflow-hidden"
+                      : ""
+                  }
+                >
+                  <MarkdownContent content={msg.content} />
+                </div>
+                {shouldCollapse && !expanded ? (
+                  <div
+                    className={`pointer-events-none absolute inset-x-0 bottom-0 h-24 ${
+                      mode === "dark"
+                        ? "bg-gradient-to-b from-transparent to-gray-900/95"
+                        : "bg-gradient-to-b from-transparent to-white/95"
+                    }`}
+                  />
+                ) : null}
+              </div>
+              {shouldCollapse ? (
+                <button
+                  type="button"
+                  onClick={() =>
+                    setExpandedMessages((prev) => ({
+                      ...prev,
+                      [msg.id]: !expanded,
+                    }))
+                  }
+                  className={`mt-2 text-xs font-medium ${
+                    mode === "dark"
+                      ? "text-sky-300 hover:text-sky-200"
+                      : "text-sky-700 hover:text-sky-600"
+                  }`}
+                >
+                  {expanded ? "Collapse" : "Expand long output"}
+                </button>
+              ) : null}
             </div>
           </div>
         );

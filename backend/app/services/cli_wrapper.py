@@ -9,10 +9,13 @@ import logging
 import subprocess
 import sys
 from abc import ABC, abstractmethod
+from collections.abc import Awaitable, Callable
 
 logger = logging.getLogger(__name__)
 
 IS_WINDOWS = sys.platform == "win32"
+STREAM_FALLBACK_CHUNK_SIZE = 160
+STREAM_FALLBACK_DELAY_S = 0.012
 
 
 class CLIAgent(ABC):
@@ -54,6 +57,25 @@ class CLIAgent(ABC):
         """Parse the raw stdout from the CLI into a clean response."""
         ...
 
+    def build_stream_preview(self, raw: str) -> str | None:
+        """Build a user-visible preview from partial raw output.
+
+        Return None when a provider does not support meaningful live previews.
+        """
+        return None
+
+    def _prepare_command(
+        self,
+        message: str,
+        session_id: str | None = None,
+    ) -> tuple[list[str], bytes | None]:
+        cmd = self.build_command(message, session_id)
+        stdin_data: bytes | None = None
+        if "\n" in message and IS_WINDOWS:
+            cmd = cmd[:-1]
+            stdin_data = message.encode("utf-8")
+        return cmd, stdin_data
+
     async def _spawn(self, cmd: list[str], stdin_data: bytes | None = None):
         """Spawn a subprocess, handling Windows shell requirements."""
         if IS_WINDOWS:
@@ -75,17 +97,8 @@ class CLIAgent(ABC):
 
     async def send(self, message: str, session_id: str | None = None) -> str:
         """Spawn the CLI subprocess, pipe the message, and return the response."""
-        cmd = self.build_command(message, session_id)
+        cmd, stdin_data = self._prepare_command(message, session_id)
         logger.info(f"Spawning agent: {' '.join(cmd[:3])}...")
-
-        # On Windows, multiline prompts get truncated by cmd.exe shell quoting.
-        # Use stdin to pass the prompt instead of a command-line argument.
-        # Both `claude -p` and `codex exec` read from stdin when no prompt arg given.
-        stdin_data: bytes | None = None
-        if "\n" in message and IS_WINDOWS:
-            # Remove the message from cmd args (it's the last element)
-            cmd = cmd[:-1]
-            stdin_data = message.encode("utf-8")
 
         try:
             process = await self._spawn(cmd, stdin_data)
@@ -127,10 +140,10 @@ class CLIAgent(ABC):
         self, message: str, session_id: str | None = None
     ):
         """Spawn the CLI subprocess and yield output chunks as they arrive."""
-        cmd = self.build_command(message, session_id)
+        cmd, stdin_data = self._prepare_command(message, session_id)
         logger.info(f"Spawning agent (streaming): {' '.join(cmd[:3])}...")
 
-        process = await self._spawn(cmd)
+        process = await self._spawn(cmd, stdin_data)
 
         try:
             assert process.stdout is not None
@@ -144,6 +157,90 @@ class CLIAgent(ABC):
 
             await process.wait()
         except asyncio.TimeoutError:
+            try:
+                process.kill()
+            except ProcessLookupError:
+                pass
+                raise TimeoutError(
+                    f"Agent did not respond within {self.timeout} seconds"
+                )
+
+    async def send_with_stream(
+        self,
+        message: str,
+        on_update: Callable[[str], Awaitable[None]],
+        session_id: str | None = None,
+    ) -> str:
+        """Spawn the CLI subprocess and stream cleaned output when possible."""
+        cmd, stdin_data = self._prepare_command(message, session_id)
+        logger.info(f"Spawning agent (stream+final): {' '.join(cmd[:3])}...")
+
+        stdout_parts: list[str] = []
+        stderr_parts: list[str] = []
+        preview = ""
+
+        process = await self._spawn(cmd, stdin_data)
+
+        async def read_stdout() -> None:
+            nonlocal preview
+            assert process.stdout is not None
+            while True:
+                chunk = await asyncio.wait_for(
+                    process.stdout.read(4096), timeout=self.timeout
+                )
+                if not chunk:
+                    break
+
+                stdout_parts.append(chunk.decode("utf-8", errors="replace"))
+                candidate = self.build_stream_preview("".join(stdout_parts))
+                if candidate is not None and candidate != preview:
+                    preview = candidate
+                    await on_update(preview)
+
+        async def read_stderr() -> None:
+            assert process.stderr is not None
+            while True:
+                chunk = await process.stderr.read(4096)
+                if not chunk:
+                    break
+                stderr_parts.append(chunk.decode("utf-8", errors="replace"))
+
+        try:
+            await asyncio.gather(read_stdout(), read_stderr())
+            await process.wait()
+
+            stdout_text = "".join(stdout_parts).strip()
+            stderr_text = "".join(stderr_parts).strip()
+
+            if process.returncode != 0:
+                logger.error(
+                    f"Agent exited with code {process.returncode}: {stderr_text}"
+                )
+                raise RuntimeError(
+                    f"Agent process failed (exit code {process.returncode}): "
+                    f"{stderr_text or stdout_text}"
+                )
+
+            if stderr_text:
+                logger.warning(f"Agent stderr: {stderr_text}")
+
+            result = self.parse_output(stdout_text)
+            if result and preview != result:
+                start = len(preview) if result.startswith(preview) else 0
+                for end in range(
+                    max(start + STREAM_FALLBACK_CHUNK_SIZE, 1),
+                    len(result) + STREAM_FALLBACK_CHUNK_SIZE,
+                    STREAM_FALLBACK_CHUNK_SIZE,
+                ):
+                    await on_update(result[: min(end, len(result))])
+                    if end < len(result):
+                        await asyncio.sleep(STREAM_FALLBACK_DELAY_S)
+
+            logger.info(f"Agent responded ({len(result)} chars)")
+            return result
+
+        except asyncio.TimeoutError:
+            logger.error(f"Agent timed out after {self.timeout}s")
             try:
                 process.kill()
             except ProcessLookupError:

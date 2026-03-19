@@ -68,6 +68,18 @@ def message_to_dict(msg: Message) -> dict:
     }
 
 
+def stream_chunk_to_dict(msg: Message, content: str) -> dict:
+    return {
+        "type": "stream_chunk",
+        "id": msg.id,
+        "room_id": msg.room_id,
+        "sender_type": msg.sender_type,
+        "sender_name": msg.sender_name,
+        "content": content,
+        "created_at": msg.created_at.isoformat() if msg.created_at else None,
+    }
+
+
 @router.websocket("/ws/{room_id}")
 async def websocket_endpoint(websocket: WebSocket, room_id: str):
     async with async_session() as db:
@@ -138,11 +150,18 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                                 },
                             )
 
+                        async def on_agent_stream(stream_msg: Message, content: str):
+                            await manager.broadcast(
+                                room_id,
+                                stream_chunk_to_dict(stream_msg, content),
+                            )
+
                         await route_message(
                             message,
                             db,
                             on_response=on_agent_response,
                             on_status=on_agent_status,
+                            on_stream=on_agent_stream,
                         )
                         await db.commit()
                     except Exception as e:
