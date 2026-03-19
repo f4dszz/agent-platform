@@ -1,4 +1,4 @@
-﻿import asyncio
+import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 
@@ -80,6 +80,33 @@ class PromptHistoryTests(AsyncDbTestCase):
             self.assertIn("[Alice]: first request", prompt)
             self.assertIn("Now respond to this request: UNIQUE_CURRENT_REQUEST", prompt)
             self.assertEqual(prompt.count("UNIQUE_CURRENT_REQUEST"), 1)
+
+    async def test_build_prompt_can_include_current_agent_message_in_history(self):
+        async with self.session_factory() as db:
+            room = Room(name="agent-chain-history")
+            db.add(room)
+            await db.flush()
+
+            current = Message(
+                room_id=room.id,
+                sender_type="claude",
+                sender_name="Claude Code",
+                content="Here is a joke.\n@codex your turn.",
+            )
+            db.add(current)
+            await db.commit()
+
+            prompt = await _build_prompt_with_history(
+                db,
+                room.id,
+                "your turn.",
+                current.id,
+                include_current_message_in_history=True,
+            )
+
+            self.assertIn("[Claude Code]: Here is a joke.", prompt)
+            self.assertIn("@codex your turn.", prompt)
+            self.assertIn("Now respond to this request: your turn.", prompt)
 
     def test_review_directive_helpers(self):
         content = "@claude refactor auth #review-by=codex, claude, codex"
@@ -254,6 +281,197 @@ class RouteMessageTests(AsyncDbTestCase):
             self.assertIn("Original user request:\nrefactor auth flow", seen_prompts[1][1])
             self.assertIn("Claude Code response to review:\nPrimary plan", seen_prompts[1][1])
 
+    async def test_route_message_triggers_agent_mentions_from_agent_response(self):
+        async with self.session_factory() as db:
+            room = Room(name="agent-chain-room")
+            claude = AgentConfig(
+                name="claude",
+                display_name="Claude Code",
+                agent_type="claude",
+                command="claude",
+            )
+            codex = AgentConfig(
+                name="codex",
+                display_name="Codex CLI",
+                agent_type="codex",
+                command="codex",
+            )
+            db.add_all([room, claude, codex])
+            await db.flush()
+
+            message = Message(
+                room_id=room.id,
+                sender_type="human",
+                sender_name="User",
+                content="@claude tell a joke",
+            )
+            db.add(message)
+            await db.flush()
+
+            seen_prompts: list[tuple[str, str]] = []
+            seen_statuses: list[tuple[str, str]] = []
+
+            async def fake_call_agent(agent_config, prompt):
+                seen_prompts.append((agent_config.name, prompt))
+                if agent_config.name == "claude":
+                    return agent_config, "Joke body.\n@codex continue in Chinese."
+                return agent_config, "中文续写"
+
+            async def on_status(agent_name: str, status: str):
+                seen_statuses.append((agent_name, status))
+
+            with patch(
+                "app.services.orchestrator._call_agent",
+                new=AsyncMock(side_effect=fake_call_agent),
+            ):
+                responses = await route_message(
+                    message,
+                    db,
+                    on_status=on_status,
+                )
+
+            self.assertEqual(
+                [response.sender_name for response in responses],
+                ["Claude Code", "Codex CLI"],
+            )
+            self.assertEqual(
+                seen_statuses,
+                [
+                    ("claude", "working"),
+                    ("claude", "idle"),
+                    ("codex", "working"),
+                    ("codex", "idle"),
+                ],
+            )
+            self.assertEqual(seen_prompts[0][0], "claude")
+            self.assertEqual(seen_prompts[1][0], "codex")
+            self.assertIn("[Claude Code]: Joke body.", seen_prompts[1][1])
+            self.assertIn("@codex continue in Chinese.", seen_prompts[1][1])
+
+    async def test_route_message_resolves_current_agent_name_from_display_name(self):
+        async with self.session_factory() as db:
+            room = Room(name="custom-agent-name-room")
+            architect = AgentConfig(
+                name="architect",
+                display_name="Architecture Claude",
+                agent_type="claude",
+                command="claude",
+            )
+            codex = AgentConfig(
+                name="codex",
+                display_name="Codex CLI",
+                agent_type="codex",
+                command="codex",
+            )
+            db.add_all([room, architect, codex])
+            await db.flush()
+
+            message = Message(
+                room_id=room.id,
+                sender_type="claude",
+                sender_name="Architecture Claude",
+                content="@architect self-check\n@codex review this",
+            )
+            db.add(message)
+            await db.flush()
+
+            with patch(
+                "app.services.orchestrator._call_agent",
+                new=AsyncMock(return_value=(codex, "reviewed")),
+            ) as mock_call_agent:
+                responses = await route_message(message, db)
+
+            self.assertEqual(mock_call_agent.await_count, 1)
+            self.assertEqual([response.sender_name for response in responses], ["Codex CLI"])
+
+    async def test_route_message_does_not_duplicate_reviewer_via_follow_up_mention(self):
+        async with self.session_factory() as db:
+            room = Room(name="review-mention-dedupe-room")
+            claude = AgentConfig(
+                name="claude",
+                display_name="Claude Code",
+                agent_type="claude",
+                command="claude",
+            )
+            codex = AgentConfig(
+                name="codex",
+                display_name="Codex CLI",
+                agent_type="codex",
+                command="codex",
+            )
+            db.add_all([room, claude, codex])
+            await db.flush()
+
+            message = Message(
+                room_id=room.id,
+                sender_type="human",
+                sender_name="User",
+                content="@claude draft a plan #review-by=codex",
+            )
+            db.add(message)
+            await db.flush()
+
+            async def fake_call_agent(agent_config, _prompt):
+                if agent_config.name == "claude":
+                    return agent_config, "Plan draft.\n@codex please review."
+                return agent_config, "Review result"
+
+            with patch(
+                "app.services.orchestrator._call_agent",
+                new=AsyncMock(side_effect=fake_call_agent),
+            ) as mock_call_agent:
+                responses = await route_message(message, db)
+
+            self.assertEqual(mock_call_agent.await_count, 2)
+            self.assertEqual(
+                [response.sender_name for response in responses],
+                ["Claude Code", "Codex CLI"],
+            )
+
+    async def test_route_message_prevents_agent_ping_pong_loops(self):
+        async with self.session_factory() as db:
+            room = Room(name="loop-room")
+            claude = AgentConfig(
+                name="claude",
+                display_name="Claude Code",
+                agent_type="claude",
+                command="claude",
+            )
+            codex = AgentConfig(
+                name="codex",
+                display_name="Codex CLI",
+                agent_type="codex",
+                command="codex",
+            )
+            db.add_all([room, claude, codex])
+            await db.flush()
+
+            message = Message(
+                room_id=room.id,
+                sender_type="human",
+                sender_name="User",
+                content="@claude start",
+            )
+            db.add(message)
+            await db.flush()
+
+            async def fake_call_agent(agent_config, prompt):
+                if agent_config.name == "claude":
+                    return agent_config, "@codex continue"
+                return agent_config, "@claude continue back"
+
+            with patch(
+                "app.services.orchestrator._call_agent",
+                new=AsyncMock(side_effect=fake_call_agent),
+            ) as mock_call_agent:
+                responses = await route_message(message, db)
+
+            self.assertEqual(mock_call_agent.await_count, 2)
+            self.assertEqual(
+                [response.sender_name for response in responses],
+                ["Claude Code", "Codex CLI"],
+            )
+
 
 class SessionManagerTests(unittest.TestCase):
     def test_session_manager_tracks_concurrent_runs(self):
@@ -351,3 +569,4 @@ class ReviewPromptTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Current git branch: review-branch.", prompt)
         self.assertIn("Original user request:\nrefactor service layer", prompt)
         self.assertIn("Claude Code response to review:\nPlan text", prompt)
+

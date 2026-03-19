@@ -28,6 +28,7 @@ logger = logging.getLogger(__name__)
 MENTION_PATTERN = re.compile(r"@(\w+)")
 REVIEW_DIRECTIVE_PATTERN = re.compile(r"#review-by=([a-zA-Z0-9_, -]+)")
 REPO_ROOT = Path(__file__).resolve().parents[3]
+MAX_AGENT_CHAIN_DEPTH = 4
 
 StatusCallback = Callable[[str, str], Awaitable[None]]
 
@@ -35,6 +36,28 @@ AGENT_CLASSES = {
     "claude": ClaudeAgent,
     "codex": CodexAgent,
 }
+
+
+def _resolve_sender_agent_names(
+    message: Message,
+    enabled_agents: list[AgentConfig],
+) -> set[str]:
+    if message.sender_type == "human":
+        return set()
+
+    sender_type = message.sender_type.lower()
+    sender_name = message.sender_name.lower()
+    resolved = {sender_type}
+
+    for agent in enabled_agents:
+        if (
+            agent.agent_type.lower() == sender_type
+            or agent.display_name.lower() == sender_name
+            or agent.name.lower() == sender_name
+        ):
+            resolved.add(agent.name.lower())
+
+    return resolved
 
 
 def extract_mentions(content: str) -> list[str]:
@@ -80,16 +103,19 @@ async def _build_prompt_with_history(
     room_id: str,
     current_content: str,
     current_message_id: str,
+    include_current_message_in_history: bool = False,
     max_messages: int = 20,
 ) -> str:
     """Prepend recent chat history so the agent can see prior conversation."""
-    result = await db.execute(
+    stmt = (
         select(Message)
         .where(Message.room_id == room_id)
-        .where(Message.id != current_message_id)  # exclude current msg to avoid duplication
         .order_by(Message.created_at.desc())
         .limit(max_messages)
     )
+    if not include_current_message_in_history:
+        stmt = stmt.where(Message.id != current_message_id)
+    result = await db.execute(stmt)
     history = list(result.scalars().all())
     history.reverse()  # chronological order
 
@@ -234,6 +260,8 @@ async def route_message(
     db: AsyncSession,
     on_response=None,
     on_status: StatusCallback | None = None,
+    chain_depth: int = 0,
+    agent_chain: tuple[str, ...] = (),
 ) -> list[Message]:
     """Route an incoming message to the appropriate agents.
 
@@ -243,7 +271,13 @@ async def route_message(
         on_response: Optional async callback(Message) called as each agent responds
                      (for real-time broadcast before all agents finish).
         on_status: Optional async callback(agent_name, status) for status updates.
+        chain_depth: Current recursive depth for agent-to-agent chaining.
+        agent_chain: Ordered names of agents already invoked in this route chain.
     """
+    if chain_depth > MAX_AGENT_CHAIN_DEPTH:
+        logger.warning("Agent chain depth exceeded for room %s", message.room_id)
+        return []
+
     mentions = extract_mentions(message.content)
     review_targets = extract_review_targets(message.content)
     clean_content = strip_control_syntax(message.content)
@@ -253,14 +287,25 @@ async def route_message(
 
     enabled_agents = await get_enabled_agents(db)
     agent_map = {a.name.lower(): a for a in enabled_agents}
+    current_sender_agents = _resolve_sender_agent_names(message, enabled_agents)
 
     targets: list[AgentConfig] = []
     if "all" in mentions:
-        targets = enabled_agents
+        targets = [
+            agent
+            for agent in enabled_agents
+            if agent.name.lower() not in current_sender_agents
+            and agent.name.lower() not in agent_chain
+        ]
     else:
         seen_agents: set[str] = set()
         for mention in mentions:
-            if mention in agent_map and mention not in seen_agents:
+            if (
+                mention in agent_map
+                and mention not in seen_agents
+                and mention not in current_sender_agents
+                and mention not in agent_chain
+            ):
                 targets.append(agent_map[mention])
                 seen_agents.add(mention)
 
@@ -277,7 +322,11 @@ async def route_message(
 
     # Build prompt with chat history so agent can see prior conversation
     prompt_with_history = await _build_prompt_with_history(
-        db, message.room_id, clean_content, message.id
+        db,
+        message.room_id,
+        clean_content,
+        message.id,
+        include_current_message_in_history=message.sender_type != "human",
     )
 
     responses: list[Message] = []
@@ -341,5 +390,20 @@ async def route_message(
 
             if on_response:
                 await on_response(review_message)
+
+        chained_agents = (
+            *agent_chain,
+            agent_config.name.lower(),
+            *(reviewer.name.lower() for reviewer in reviewer_configs),
+        )
+        chained_responses = await route_message(
+            agent_message,
+            db,
+            on_response=on_response,
+            on_status=on_status,
+            chain_depth=chain_depth + 1,
+            agent_chain=chained_agents,
+        )
+        responses.extend(chained_responses)
 
     return responses
