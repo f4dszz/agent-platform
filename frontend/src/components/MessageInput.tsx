@@ -125,7 +125,7 @@ export default function MessageInput({
           onChange={(e) => handleChange(e.target.value)}
           onKeyDown={handleKeyDown}
           disabled={disabled}
-          placeholder="Message...  use @claude  @codex  @all"
+          placeholder="Message... use @claude / @codex / @all, optional #review-by=codex"
           rows={1}
           className={`flex-1 ${tk.inputBg} ${tk.inputText} rounded-xl px-4 py-2.5 text-sm resize-none outline-none border ${tk.inputBorder} focus:border-blue-500/50 focus:ring-1 focus:ring-blue-500/30 ${tk.inputPlaceholder} disabled:opacity-40 transition-all`}
         />

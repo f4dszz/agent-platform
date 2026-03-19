@@ -10,6 +10,9 @@ Rules:
 import asyncio
 import logging
 import re
+import subprocess
+from pathlib import Path
+from typing import Awaitable, Callable
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -23,6 +26,10 @@ from app.services.session_manager import session_manager
 logger = logging.getLogger(__name__)
 
 MENTION_PATTERN = re.compile(r"@(\w+)")
+REVIEW_DIRECTIVE_PATTERN = re.compile(r"#review-by=([a-zA-Z0-9_, -]+)")
+REPO_ROOT = Path(__file__).resolve().parents[3]
+
+StatusCallback = Callable[[str, str], Awaitable[None]]
 
 AGENT_CLASSES = {
     "claude": ClaudeAgent,
@@ -36,6 +43,29 @@ def extract_mentions(content: str) -> list[str]:
 
 def strip_mentions(content: str) -> str:
     return MENTION_PATTERN.sub("", content).strip()
+
+
+def extract_review_targets(content: str) -> list[str]:
+    match = REVIEW_DIRECTIVE_PATTERN.search(content)
+    if not match:
+        return []
+
+    targets: list[str] = []
+    seen: set[str] = set()
+    for raw_target in match.group(1).split(","):
+        target = raw_target.strip().lower()
+        if target and target not in seen:
+            targets.append(target)
+            seen.add(target)
+    return targets
+
+
+def strip_review_directives(content: str) -> str:
+    return REVIEW_DIRECTIVE_PATTERN.sub("", content).strip()
+
+
+def strip_control_syntax(content: str) -> str:
+    return strip_mentions(strip_review_directives(content)).strip()
 
 
 async def get_enabled_agents(db: AsyncSession) -> list[AgentConfig]:
@@ -99,10 +129,15 @@ async def _call_agent(
     )
 
     session_manager.get_or_create_session(agent_config.name)
-    session_manager.set_busy(agent_config.name, True)
+    provider_session_id = session_manager.get_provider_session_id(agent_config.name)
+    session_manager.start_run(agent_config.name)
 
     try:
-        response_text = await agent.send(prompt)
+        response_text = await agent.send(prompt, session_id=provider_session_id)
+        if agent.last_session_id:
+            session_manager.set_provider_session_id(
+                agent_config.name, agent.last_session_id
+            )
         session_manager.increment_messages(agent_config.name)
 
         if session_manager.should_rotate(agent_config.name):
@@ -112,15 +147,93 @@ async def _call_agent(
         logger.error(f"Agent {agent_config.name} failed: {e}")
         response_text = f"Agent error: {e}"
     finally:
-        session_manager.set_busy(agent_config.name, False)
+        session_manager.finish_run(agent_config.name)
 
     return agent_config, response_text
+
+
+async def _run_agent_call(
+    agent_config: AgentConfig,
+    prompt: str,
+    on_status: StatusCallback | None = None,
+) -> tuple[AgentConfig, str]:
+    if on_status:
+        await on_status(agent_config.name, "working")
+    try:
+        return await _call_agent(agent_config, prompt)
+    finally:
+        if on_status:
+            await on_status(agent_config.name, "idle")
+
+
+def _get_git_context() -> str:
+    try:
+        branch = subprocess.run(
+            ["git", "branch", "--show-current"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip() or "(detached HEAD)"
+    except Exception:
+        return "Git branch information unavailable."
+
+    try:
+        status_output = subprocess.run(
+            ["git", "status", "--short"],
+            cwd=REPO_ROOT,
+            capture_output=True,
+            text=True,
+            check=True,
+        ).stdout.strip()
+    except Exception:
+        status_output = ""
+
+    lines = [f"Current git branch: {branch}."]
+    if status_output:
+        changed = status_output.splitlines()[:10]
+        lines.append("Working tree status:")
+        lines.extend(changed)
+        if len(status_output.splitlines()) > len(changed):
+            lines.append("...")
+    else:
+        lines.append("Working tree status: clean.")
+
+    return "\n".join(lines)
+
+
+async def _build_review_prompt(
+    original_request: str,
+    primary_agent: AgentConfig,
+    primary_response: str,
+) -> str:
+    git_context = await asyncio.to_thread(_get_git_context)
+    return "\n".join(
+        [
+            "You are reviewing another AI agent's proposed plan or output.",
+            "Focus on risks, missing steps, branch-related concerns, and concrete corrections.",
+            "Do not rewrite everything from scratch unless the original plan is fundamentally broken.",
+            "",
+            git_context,
+            "",
+            f"Original user request:\n{original_request}",
+            "",
+            f"{primary_agent.display_name} response to review:\n{primary_response}",
+            "",
+            "Return a concise review with:",
+            "1. Major risks",
+            "2. Missing considerations",
+            "3. Branch / workspace cautions",
+            "4. Final recommendation",
+        ]
+    )
 
 
 async def route_message(
     message: Message,
     db: AsyncSession,
     on_response=None,
+    on_status: StatusCallback | None = None,
 ) -> list[Message]:
     """Route an incoming message to the appropriate agents.
 
@@ -129,9 +242,11 @@ async def route_message(
         db: Database session.
         on_response: Optional async callback(Message) called as each agent responds
                      (for real-time broadcast before all agents finish).
+        on_status: Optional async callback(agent_name, status) for status updates.
     """
     mentions = extract_mentions(message.content)
-    clean_content = strip_mentions(message.content)
+    review_targets = extract_review_targets(message.content)
+    clean_content = strip_control_syntax(message.content)
 
     if not mentions:
         return []
@@ -143,29 +258,39 @@ async def route_message(
     if "all" in mentions:
         targets = enabled_agents
     else:
+        seen_agents: set[str] = set()
         for mention in mentions:
-            if mention in agent_map:
+            if mention in agent_map and mention not in seen_agents:
                 targets.append(agent_map[mention])
+                seen_agents.add(mention)
 
     if not targets:
         return []
+
+    reviewer_configs: list[AgentConfig] = []
+    seen_reviewers: set[str] = set()
+    primary_names = {target.name.lower() for target in targets}
+    for reviewer_name in review_targets:
+        if reviewer_name in agent_map and reviewer_name not in primary_names and reviewer_name not in seen_reviewers:
+            reviewer_configs.append(agent_map[reviewer_name])
+            seen_reviewers.add(reviewer_name)
 
     # Build prompt with chat history so agent can see prior conversation
     prompt_with_history = await _build_prompt_with_history(
         db, message.room_id, clean_content, message.id
     )
 
-    # Call all agents in parallel
-    tasks = [_call_agent(cfg, prompt_with_history) for cfg in targets]
-    results = await asyncio.gather(*tasks, return_exceptions=True)
-
     responses: list[Message] = []
-    for result in results:
-        if isinstance(result, Exception):
-            logger.error(f"Agent call failed: {result}")
+    tasks = [
+        asyncio.create_task(_run_agent_call(cfg, prompt_with_history, on_status))
+        for cfg in targets
+    ]
+    for task in asyncio.as_completed(tasks):
+        try:
+            agent_config, response_text = await task
+        except Exception as e:
+            logger.error(f"Agent call failed: {e}")
             continue
-
-        agent_config, response_text = result
 
         agent_message = Message(
             room_id=message.room_id,
@@ -181,5 +306,40 @@ async def route_message(
         # Stream each response to clients as it arrives
         if on_response:
             await on_response(agent_message)
+
+        for reviewer_config in reviewer_configs:
+            review_prompt = await _build_review_prompt(
+                clean_content,
+                agent_config,
+                response_text,
+            )
+            try:
+                _, review_text = await _run_agent_call(
+                    reviewer_config,
+                    review_prompt,
+                    on_status,
+                )
+            except Exception as e:
+                logger.error(
+                    "Review agent %s failed after %s response: %s",
+                    reviewer_config.name,
+                    agent_config.name,
+                    e,
+                )
+                continue
+
+            review_message = Message(
+                room_id=message.room_id,
+                sender_type=reviewer_config.agent_type,
+                sender_name=reviewer_config.display_name,
+                content=review_text,
+            )
+            db.add(review_message)
+            await db.flush()
+            await db.refresh(review_message)
+            responses.append(review_message)
+
+            if on_response:
+                await on_response(review_message)
 
     return responses

@@ -31,6 +31,11 @@ class CLIAgent(ABC):
         self.permission_mode = permission_mode
         self.allowed_tools = allowed_tools
         self.system_prompt = system_prompt
+        self._last_session_id: str | None = None
+
+    @property
+    def last_session_id(self) -> str | None:
+        return self._last_session_id
 
     @abstractmethod
     def build_command(self, message: str, session_id: str | None = None) -> list[str]:

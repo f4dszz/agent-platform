@@ -23,9 +23,10 @@ class AgentSession:
 
     session_id: str = field(default_factory=lambda: str(uuid.uuid4()))
     agent_name: str = ""
+    provider_session_id: str | None = None
     message_count: int = 0
     estimated_tokens: int = 0
-    busy: bool = False
+    active_runs: int = 0
     created_at: datetime = field(default_factory=lambda: datetime.now(timezone.utc))
     summaries: list[str] = field(default_factory=list)
 
@@ -47,9 +48,10 @@ class SessionManager:
             return None
         return {
             "session_id": session.session_id,
+            "provider_session_id": session.provider_session_id,
             "message_count": session.message_count,
             "estimated_tokens": session.estimated_tokens,
-            "busy": session.busy,
+            "busy": session.active_runs > 0,
             "created_at": session.created_at.isoformat(),
         }
 
@@ -63,10 +65,29 @@ class SessionManager:
             )
         return self.get_session(agent_name)  # type: ignore[return-value]
 
-    def set_busy(self, agent_name: str, busy: bool) -> None:
-        """Mark an agent as busy or idle."""
+    def start_run(self, agent_name: str) -> None:
+        """Increment the number of in-flight runs for an agent."""
+        self.get_or_create_session(agent_name)
+        self._sessions[agent_name].active_runs += 1
+
+    def finish_run(self, agent_name: str) -> None:
+        """Decrement the number of in-flight runs for an agent."""
         if agent_name in self._sessions:
-            self._sessions[agent_name].busy = busy
+            session = self._sessions[agent_name]
+            session.active_runs = max(0, session.active_runs - 1)
+
+    def set_busy(self, agent_name: str, busy: bool) -> None:
+        """Backwards-compatible wrapper for callers that set a boolean status."""
+        self.get_or_create_session(agent_name)
+        self._sessions[agent_name].active_runs = 1 if busy else 0
+
+    def get_provider_session_id(self, agent_name: str) -> str | None:
+        session = self._sessions.get(agent_name)
+        return session.provider_session_id if session else None
+
+    def set_provider_session_id(self, agent_name: str, provider_session_id: str) -> None:
+        self.get_or_create_session(agent_name)
+        self._sessions[agent_name].provider_session_id = provider_session_id
 
     def increment_messages(self, agent_name: str, estimated_tokens: int = 0) -> None:
         """Increment the message count and token estimate for a session."""
