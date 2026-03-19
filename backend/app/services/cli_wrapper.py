@@ -34,7 +34,14 @@ class CLIAgent(ABC):
 
     @abstractmethod
     def build_command(self, message: str, session_id: str | None = None) -> list[str]:
-        """Build the full command + args list for subprocess."""
+        """Build the full command + args list for subprocess.
+
+        Returns (cmd_args, stdin_text): cmd_args is the command without the
+        message, stdin_text is the prompt to pipe via stdin.  Subclasses may
+        return the message as the last element of cmd_args for backward compat,
+        but the base send() will pop it and use stdin instead when the message
+        contains newlines (e.g. chat history).
+        """
         ...
 
     @abstractmethod
@@ -42,20 +49,21 @@ class CLIAgent(ABC):
         """Parse the raw stdout from the CLI into a clean response."""
         ...
 
-    async def _spawn(self, cmd: list[str]):
+    async def _spawn(self, cmd: list[str], stdin_data: bytes | None = None):
         """Spawn a subprocess, handling Windows shell requirements."""
         if IS_WINDOWS:
-            # On Windows, npm-installed CLIs are .cmd scripts that need shell
             cmd_str = subprocess.list2cmdline(cmd)
             logger.info(f"Windows shell command: {cmd_str[:200]}")
             return await asyncio.create_subprocess_shell(
                 cmd_str,
+                stdin=asyncio.subprocess.PIPE if stdin_data else None,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
         else:
             return await asyncio.create_subprocess_exec(
                 *cmd,
+                stdin=asyncio.subprocess.PIPE if stdin_data else None,
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
@@ -65,11 +73,20 @@ class CLIAgent(ABC):
         cmd = self.build_command(message, session_id)
         logger.info(f"Spawning agent: {' '.join(cmd[:3])}...")
 
+        # On Windows, multiline prompts get truncated by cmd.exe shell quoting.
+        # Use stdin to pass the prompt instead of a command-line argument.
+        # Both `claude -p` and `codex exec` read from stdin when no prompt arg given.
+        stdin_data: bytes | None = None
+        if "\n" in message and IS_WINDOWS:
+            # Remove the message from cmd args (it's the last element)
+            cmd = cmd[:-1]
+            stdin_data = message.encode("utf-8")
+
         try:
-            process = await self._spawn(cmd)
+            process = await self._spawn(cmd, stdin_data)
 
             stdout, stderr = await asyncio.wait_for(
-                process.communicate(), timeout=self.timeout
+                process.communicate(input=stdin_data), timeout=self.timeout
             )
 
             stdout_text = stdout.decode("utf-8", errors="replace").strip()

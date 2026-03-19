@@ -66,12 +66,18 @@ async def _build_prompt_with_history(
     if not history:
         return current_content
 
-    lines = ["[Chat History]"]
+    lines = [
+        "Below is the conversation history from a shared chat room. "
+        "Multiple users and AI agents participate. "
+        "Read the history for context, then respond ONLY to the current request at the end.",
+        "",
+        "--- CONVERSATION HISTORY ---",
+    ]
     for msg in history:
-        lines.append(f"{msg.sender_name}: {msg.content}")
+        lines.append(f"[{msg.sender_name}]: {msg.content}")
+    lines.append("--- END HISTORY ---")
     lines.append("")
-    lines.append("[Current Request]")
-    lines.append(current_content)
+    lines.append(f"Now respond to this request: {current_content}")
 
     return "\n".join(lines)
 
