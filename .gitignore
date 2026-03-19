@@ -39,3 +39,4 @@ venv/
 
 # Vite
 frontend/dist/
+*.tsbuildinfo
