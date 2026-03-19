@@ -14,6 +14,9 @@ from app.services.orchestrator import (
     _build_prompt_with_history,
     _build_review_prompt,
     _call_agent,
+    extract_agent_handoff_targets,
+    extract_agent_handoff_request,
+    extract_referenced_agent_names,
     extract_review_targets,
     route_message,
     strip_control_syntax,
@@ -112,6 +115,51 @@ class PromptHistoryTests(AsyncDbTestCase):
         content = "@claude refactor auth #review-by=codex, claude, codex"
         self.assertEqual(extract_review_targets(content), ["codex", "claude"])
         self.assertEqual(strip_control_syntax(content), "refactor auth")
+
+    def test_agent_handoff_requires_explicit_syntax(self):
+        content = "You can also ask @codex for a second opinion."
+        self.assertEqual(extract_agent_handoff_targets(content), [])
+        self.assertEqual(
+            extract_agent_handoff_request(content),
+            "You can also ask for a second opinion.",
+        )
+
+        explicit_handoff = "Plan draft.\n@codex review this\n#handoff=claude"
+        self.assertEqual(
+            extract_agent_handoff_targets(explicit_handoff),
+            ["codex", "claude"],
+        )
+        self.assertEqual(
+            extract_agent_handoff_request(explicit_handoff),
+            "review this",
+        )
+
+        directive_handoff = "Plan draft.\n#handoff=codex\nReview the plan above."
+        self.assertEqual(
+            extract_agent_handoff_request(directive_handoff),
+            "Review the plan above.",
+        )
+
+    def test_extract_referenced_agent_names_from_human_text(self):
+        agents = [
+            AgentConfig(
+                name="claude",
+                display_name="Claude Code",
+                agent_type="claude",
+                command="claude",
+            ),
+            AgentConfig(
+                name="codex",
+                display_name="Codex CLI",
+                agent_type="codex",
+                command="codex",
+            ),
+        ]
+        content = "@claude plan first, then let codex review, and compare Claude Code with Codex CLI"
+        self.assertEqual(
+            extract_referenced_agent_names(content, agents),
+            ["claude", "codex"],
+        )
 
 
 class RouteMessageTests(AsyncDbTestCase):
@@ -315,7 +363,7 @@ class RouteMessageTests(AsyncDbTestCase):
                 seen_prompts.append((agent_config.name, prompt))
                 if agent_config.name == "claude":
                     return agent_config, "Joke body.\n@codex continue in Chinese."
-                return agent_config, "中文续写"
+                return agent_config, "Chinese continuation"
 
             async def on_status(agent_name: str, status: str):
                 seen_statuses.append((agent_name, status))
@@ -347,6 +395,138 @@ class RouteMessageTests(AsyncDbTestCase):
             self.assertEqual(seen_prompts[1][0], "codex")
             self.assertIn("[Claude Code]: Joke body.", seen_prompts[1][1])
             self.assertIn("@codex continue in Chinese.", seen_prompts[1][1])
+            self.assertIn("Now respond to this request: continue in Chinese.", seen_prompts[1][1])
+
+    async def test_route_message_ignores_inline_agent_mentions_in_agent_text(self):
+        async with self.session_factory() as db:
+            room = Room(name="inline-mention-room")
+            claude = AgentConfig(
+                name="claude",
+                display_name="Claude Code",
+                agent_type="claude",
+                command="claude",
+            )
+            codex = AgentConfig(
+                name="codex",
+                display_name="Codex CLI",
+                agent_type="codex",
+                command="codex",
+            )
+            db.add_all([room, claude, codex])
+            await db.flush()
+
+            message = Message(
+                room_id=room.id,
+                sender_type="human",
+                sender_name="User",
+                content="@claude explain review options",
+            )
+            db.add(message)
+            await db.flush()
+
+            async def fake_call_agent(agent_config, _prompt):
+                return agent_config, "You can also ask @codex for a second opinion."
+
+            with patch(
+                "app.services.orchestrator._call_agent",
+                new=AsyncMock(side_effect=fake_call_agent),
+            ) as mock_call_agent:
+                responses = await route_message(message, db)
+
+            self.assertEqual(mock_call_agent.await_count, 1)
+            self.assertEqual(
+                [response.sender_name for response in responses],
+                ["Claude Code"],
+            )
+
+    async def test_route_message_supports_explicit_handoff_directive(self):
+        async with self.session_factory() as db:
+            room = Room(name="handoff-directive-room")
+            claude = AgentConfig(
+                name="claude",
+                display_name="Claude Code",
+                agent_type="claude",
+                command="claude",
+            )
+            codex = AgentConfig(
+                name="codex",
+                display_name="Codex CLI",
+                agent_type="codex",
+                command="codex",
+            )
+            db.add_all([room, claude, codex])
+            await db.flush()
+
+            message = Message(
+                room_id=room.id,
+                sender_type="human",
+                sender_name="User",
+                content="@claude draft a plan",
+            )
+            db.add(message)
+            await db.flush()
+
+            async def fake_call_agent(agent_config, _prompt):
+                if agent_config.name == "claude":
+                    return agent_config, "Plan draft.\n#handoff=codex\nReview this."
+                return agent_config, "Review result"
+
+            with patch(
+                "app.services.orchestrator._call_agent",
+                new=AsyncMock(side_effect=fake_call_agent),
+            ) as mock_call_agent:
+                responses = await route_message(message, db)
+
+            self.assertEqual(mock_call_agent.await_count, 2)
+            self.assertEqual(
+                [response.sender_name for response in responses],
+                ["Claude Code", "Codex CLI"],
+            )
+
+    async def test_route_message_adds_collaboration_hint_for_named_follow_up_agent(self):
+        async with self.session_factory() as db:
+            room = Room(name="collaboration-hint-room")
+            claude = AgentConfig(
+                name="claude",
+                display_name="Claude Code",
+                agent_type="claude",
+                command="claude",
+            )
+            codex = AgentConfig(
+                name="codex",
+                display_name="Codex CLI",
+                agent_type="codex",
+                command="codex",
+            )
+            db.add_all([room, claude, codex])
+            await db.flush()
+
+            message = Message(
+                room_id=room.id,
+                sender_type="human",
+                sender_name="User",
+                content="@claude plan first, then let codex review",
+            )
+            db.add(message)
+            await db.flush()
+
+            seen_prompts: list[str] = []
+
+            async def fake_call_agent(agent_config, prompt):
+                seen_prompts.append(prompt)
+                return agent_config, "Plan draft"
+
+            with patch(
+                "app.services.orchestrator._call_agent",
+                new=AsyncMock(side_effect=fake_call_agent),
+            ):
+                responses = await route_message(message, db)
+
+            self.assertEqual([response.sender_name for response in responses], ["Claude Code"])
+            self.assertEqual(len(seen_prompts), 1)
+            self.assertIn("Platform instruction:", seen_prompts[0])
+            self.assertIn("#handoff=codex", seen_prompts[0])
+            self.assertIn("do not claim you need permission", seen_prompts[0])
 
     async def test_route_message_resolves_current_agent_name_from_display_name(self):
         async with self.session_factory() as db:
@@ -530,6 +710,44 @@ class AgentSessionReuseTests(unittest.IsolatedAsyncioTestCase):
             await _call_agent(agent, "second prompt")
 
         self.assertEqual(captured_session_ids, [None, "provider-session-1"])
+
+    async def test_call_agent_appends_platform_collaboration_prompt(self):
+        captured_system_prompts: list[str | None] = []
+
+        class FakeClaudeAgent:
+            def __init__(self, **kwargs):
+                captured_system_prompts.append(kwargs.get("system_prompt"))
+                self._last_session_id = None
+
+            @property
+            def last_session_id(self):
+                return self._last_session_id
+
+            async def send(self, _prompt, session_id=None):
+                return "ok"
+
+        agent = AgentConfig(
+            name="claude-reuse",
+            display_name="Claude Code",
+            agent_type="claude",
+            command="claude",
+            system_prompt="Custom instruction",
+        )
+
+        with patch.dict(
+            "app.services.orchestrator.AGENT_CLASSES",
+            {"claude": FakeClaudeAgent},
+            clear=False,
+        ):
+            await _call_agent(agent, "prompt")
+
+        self.assertEqual(len(captured_system_prompts), 1)
+        self.assertIn("Custom instruction", captured_system_prompts[0])
+        self.assertIn("#handoff=<agent-name>", captured_system_prompts[0])
+        self.assertIn(
+            "Do not try to invoke other local CLIs",
+            captured_system_prompts[0],
+        )
 
 
 class DatabaseAndRoomValidationTests(AsyncDbTestCase):

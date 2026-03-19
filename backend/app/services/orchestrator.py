@@ -26,9 +26,27 @@ from app.services.session_manager import session_manager
 logger = logging.getLogger(__name__)
 
 MENTION_PATTERN = re.compile(r"@(\w+)")
+LINE_HANDOFF_PATTERN = re.compile(r"(?m)^\s*@(\w+)\b")
+LINE_HANDOFF_WITH_REQUEST_PATTERN = re.compile(r"^\s*@(\w+)\b(.*)$")
 REVIEW_DIRECTIVE_PATTERN = re.compile(r"#review-by=([a-zA-Z0-9_, -]+)")
+HANDOFF_DIRECTIVE_PATTERN = re.compile(r"#handoff=([a-zA-Z0-9_, -]+)")
 REPO_ROOT = Path(__file__).resolve().parents[3]
 MAX_AGENT_CHAIN_DEPTH = 4
+PLATFORM_AGENT_SYSTEM_PROMPT = """
+You are one AI agent participating in a shared multi-agent room.
+
+Rules for collaboration:
+- Do not try to invoke other local CLIs, subprocesses, terminals, or tools to contact another agent.
+- Do not ask the human for permission to run another agent on your behalf.
+- If another agent should continue, emit a handoff instruction instead of trying to call it yourself.
+- Preferred handoff format:
+  #handoff=<agent-name>
+  <the exact request for that agent>
+- You may also use a single new line like:
+  @codex review the plan above
+- Normal inline mentions inside prose should be avoided unless you intend a handoff.
+- Keep your own answer for the human separate from the handoff request for the next agent.
+""".strip()
 
 StatusCallback = Callable[[str, str], Awaitable[None]]
 
@@ -64,12 +82,8 @@ def extract_mentions(content: str) -> list[str]:
     return [m.lower() for m in MENTION_PATTERN.findall(content)]
 
 
-def strip_mentions(content: str) -> str:
-    return MENTION_PATTERN.sub("", content).strip()
-
-
-def extract_review_targets(content: str) -> list[str]:
-    match = REVIEW_DIRECTIVE_PATTERN.search(content)
+def _extract_directive_targets(content: str, pattern: re.Pattern[str]) -> list[str]:
+    match = pattern.search(content)
     if not match:
         return []
 
@@ -83,12 +97,131 @@ def extract_review_targets(content: str) -> list[str]:
     return targets
 
 
+def extract_agent_handoff_targets(content: str) -> list[str]:
+    targets: list[str] = []
+    seen: set[str] = set()
+
+    for target in LINE_HANDOFF_PATTERN.findall(content):
+        lowered = target.lower()
+        if lowered not in seen:
+            targets.append(lowered)
+            seen.add(lowered)
+
+    for target in _extract_directive_targets(content, HANDOFF_DIRECTIVE_PATTERN):
+        if target not in seen:
+            targets.append(target)
+            seen.add(target)
+
+    return targets
+
+
+def extract_agent_handoff_request(content: str) -> str:
+    lines = content.splitlines()
+    for index, line in enumerate(lines):
+        handoff_match = LINE_HANDOFF_WITH_REQUEST_PATTERN.match(line)
+        if handoff_match:
+            inline_request = handoff_match.group(2).strip()
+            if inline_request:
+                return inline_request
+
+            trailing_request = "\n".join(lines[index + 1 :]).strip()
+            if trailing_request:
+                return trailing_request
+            break
+
+        directive_match = HANDOFF_DIRECTIVE_PATTERN.fullmatch(line.strip())
+        if directive_match:
+            trailing_request = "\n".join(lines[index + 1 :]).strip()
+            if trailing_request:
+                return trailing_request
+            break
+
+    return re.sub(r"[ \t]{2,}", " ", strip_control_syntax(content)).strip()
+
+
+def extract_referenced_agent_names(
+    content: str,
+    enabled_agents: list[AgentConfig],
+) -> list[str]:
+    lowered = content.lower()
+    referenced: list[str] = []
+    seen: set[str] = set()
+
+    for agent in enabled_agents:
+        name = agent.name.lower()
+        display_name = agent.display_name.lower()
+        if (
+            name in lowered
+            or display_name in lowered
+            or f"@{name}" in lowered
+        ) and name not in seen:
+            referenced.append(name)
+            seen.add(name)
+
+    return referenced
+
+
+def _build_human_collaboration_hint(
+    message_content: str,
+    enabled_agents: list[AgentConfig],
+    primary_targets: list[AgentConfig],
+    review_targets: list[str],
+) -> str:
+    if len(primary_targets) != 1:
+        return ""
+
+    referenced_agents = extract_referenced_agent_names(message_content, enabled_agents)
+    primary_names = {target.name.lower() for target in primary_targets}
+    collaborator_names = [
+        name
+        for name in referenced_agents
+        if name not in primary_names and name not in review_targets
+    ]
+    if not collaborator_names:
+        return ""
+
+    collaborator_list = ", ".join(collaborator_names)
+    preferred_target = collaborator_names[0]
+    return "\n".join(
+        [
+            "",
+            "Platform instruction:",
+            (
+                "The user also referenced these agents for possible follow-up: "
+                f"{collaborator_list}."
+            ),
+            (
+                "If you want one of them to continue, do not claim you need permission "
+                "and do not try to run their CLI yourself."
+            ),
+            (
+                f"Instead, end your reply with an explicit handoff such as "
+                f"`#handoff={preferred_target}` followed by the exact request for that agent."
+            ),
+        ]
+    )
+
+
+def strip_mentions(content: str) -> str:
+    return MENTION_PATTERN.sub("", content).strip()
+
+
+def extract_review_targets(content: str) -> list[str]:
+    return _extract_directive_targets(content, REVIEW_DIRECTIVE_PATTERN)
+
+
 def strip_review_directives(content: str) -> str:
     return REVIEW_DIRECTIVE_PATTERN.sub("", content).strip()
 
 
+def strip_handoff_directives(content: str) -> str:
+    return HANDOFF_DIRECTIVE_PATTERN.sub("", content).strip()
+
+
 def strip_control_syntax(content: str) -> str:
-    return strip_mentions(strip_review_directives(content)).strip()
+    return strip_mentions(
+        strip_handoff_directives(strip_review_directives(content))
+    ).strip()
 
 
 async def get_enabled_agents(db: AsyncSession) -> list[AgentConfig]:
@@ -146,12 +279,18 @@ async def _call_agent(
     if not agent_class:
         return agent_config, f"No wrapper for agent type: {agent_config.agent_type}"
 
+    effective_system_prompt = PLATFORM_AGENT_SYSTEM_PROMPT
+    if agent_config.system_prompt:
+        effective_system_prompt = (
+            f"{agent_config.system_prompt.strip()}\n\n{PLATFORM_AGENT_SYSTEM_PROMPT}"
+        )
+
     agent = agent_class(
         command=agent_config.command,
         timeout=agent_config.max_timeout,
         permission_mode=agent_config.permission_mode,
         allowed_tools=agent_config.allowed_tools,
-        system_prompt=agent_config.system_prompt,
+        system_prompt=effective_system_prompt,
     )
 
     session_manager.get_or_create_session(agent_config.name)
@@ -278,9 +417,13 @@ async def route_message(
         logger.warning("Agent chain depth exceeded for room %s", message.room_id)
         return []
 
-    mentions = extract_mentions(message.content)
+    if message.sender_type == "human":
+        mentions = extract_mentions(message.content)
+        clean_content = strip_control_syntax(message.content)
+    else:
+        mentions = extract_agent_handoff_targets(message.content)
+        clean_content = extract_agent_handoff_request(message.content)
     review_targets = extract_review_targets(message.content)
-    clean_content = strip_control_syntax(message.content)
 
     if not mentions:
         return []
@@ -320,11 +463,23 @@ async def route_message(
             reviewer_configs.append(agent_map[reviewer_name])
             seen_reviewers.add(reviewer_name)
 
+    prompt_request = clean_content
+    if message.sender_type == "human":
+        prompt_request = (
+            clean_content
+            + _build_human_collaboration_hint(
+                message.content,
+                enabled_agents,
+                targets,
+                review_targets,
+            )
+        )
+
     # Build prompt with chat history so agent can see prior conversation
     prompt_with_history = await _build_prompt_with_history(
         db,
         message.room_id,
-        clean_content,
+        prompt_request,
         message.id,
         include_current_message_in_history=message.sender_type != "human",
     )
