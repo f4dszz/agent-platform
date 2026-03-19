@@ -20,13 +20,27 @@ from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import AgentConfig
+from app.models.agent_artifact import AgentArtifact
+from app.models.collaboration_run import CollaborationRun
 from app.models.message import Message
 from app.services.agent_memory_store import (
     build_agent_memory_context,
     get_or_create_agent_memory,
     sync_agent_memory_from_runtime,
 )
+from app.services.artifact_extractor import ExtractedArtifact, extract_artifact
 from app.services.claude_agent import ClaudeAgent
+from app.services.collaboration_policy import (
+    RUN_STATUS_BLOCKED,
+    RUN_STATUS_COMPLETED,
+    RUN_STATUS_RUNNING,
+    RUN_STATUS_STOPPED,
+    finalize_run_from_artifact,
+    register_review_round,
+    register_step,
+    should_stop_for_limits,
+    stop_run,
+)
 from app.services.codex_agent import CodexAgent
 from app.services.session_manager import session_manager
 
@@ -49,6 +63,12 @@ Rules for collaboration:
 - Preferred handoff format:
   #handoff=<agent-name>
   <the exact request for that agent>
+- When your output is intended to be reused by another agent, prefer adding:
+  #artifact=plan|review|decision|todo|summary
+- Review outputs should also include:
+  #status=approved|revise|blocked
+- Final decision outputs should also include:
+  #status=completed|blocked|revise
 - You may also use a single new line like:
   @codex review the plan above
 - Normal inline mentions inside prose should be avoided unless you intend a handoff.
@@ -62,6 +82,112 @@ AGENT_CLASSES = {
     "claude": ClaudeAgent,
     "codex": CodexAgent,
 }
+
+
+async def _get_collaboration_run(
+    db: AsyncSession,
+    run_id: str | None,
+) -> CollaborationRun | None:
+    if not run_id:
+        return None
+    result = await db.execute(
+        select(CollaborationRun).where(CollaborationRun.id == run_id)
+    )
+    return result.scalar_one_or_none()
+
+
+async def _get_or_create_collaboration_run(
+    db: AsyncSession,
+    message: Message,
+    review_targets: list[str],
+    run_id: str | None = None,
+) -> CollaborationRun:
+    existing = await _get_collaboration_run(db, run_id)
+    if existing:
+        return existing
+
+    mode = "plan_review" if review_targets else "custom"
+    run = CollaborationRun(
+        room_id=message.room_id,
+        root_message_id=message.id,
+        initiator_type=message.sender_type,
+        mode=mode,
+        status=RUN_STATUS_RUNNING,
+    )
+    db.add(run)
+    await db.flush()
+    return run
+
+
+async def _hydrate_runtime_from_memory(
+    db: AsyncSession,
+    room_id: str,
+    agent_name: str,
+) -> None:
+    memory = await get_or_create_agent_memory(db, room_id, agent_name)
+    session_manager.hydrate_session(
+        agent_name,
+        room_id,
+        memory.provider_session_id,
+        memory.message_count,
+        memory.estimated_tokens,
+    )
+
+
+async def _sync_runtime_to_memory(
+    db: AsyncSession,
+    room_id: str,
+    agent_name: str,
+) -> None:
+    runtime_session = session_manager.get_session(agent_name, room_id)
+    if not runtime_session:
+        return
+    await sync_agent_memory_from_runtime(
+        db,
+        room_id,
+        agent_name,
+        runtime_session.get("provider_session_id"),
+        runtime_session.get("message_count", 0),
+        runtime_session.get("estimated_tokens", 0),
+    )
+
+
+async def _create_agent_artifact(
+    db: AsyncSession,
+    run: CollaborationRun,
+    message: Message,
+    agent_name: str,
+    extracted: ExtractedArtifact,
+) -> AgentArtifact | None:
+    if not extracted.artifact_type or not extracted.clean_content:
+        return None
+
+    artifact = AgentArtifact(
+        run_id=run.id,
+        room_id=message.room_id,
+        source_message_id=message.id,
+        agent_name=agent_name,
+        artifact_type=extracted.artifact_type,
+        title=extracted.title,
+        content=extracted.clean_content,
+        status=extracted.status,
+    )
+    db.add(artifact)
+    await db.flush()
+    return artifact
+
+
+async def _list_run_artifacts(
+    db: AsyncSession,
+    run_id: str,
+    artifact_type: str | None = None,
+) -> list[AgentArtifact]:
+    stmt = select(AgentArtifact).where(AgentArtifact.run_id == run_id)
+    if artifact_type:
+        stmt = stmt.where(AgentArtifact.artifact_type == artifact_type)
+    stmt = stmt.order_by(AgentArtifact.created_at.asc())
+    result = await db.execute(stmt)
+    return list(result.scalars().all())
 
 
 def _resolve_sender_agent_names(
@@ -323,6 +449,7 @@ async def _call_agent(
     *,
     db: AsyncSession | None = None,
     room_id: str | None = None,
+    manage_room_memory: bool = True,
 ) -> tuple[AgentConfig, str]:
     """Call a single agent and return (config, response_text)."""
     agent_class = AGENT_CLASSES.get(agent_config.agent_type)
@@ -343,15 +470,10 @@ async def _call_agent(
         system_prompt=effective_system_prompt,
     )
 
-    if db and room_id:
-        memory = await get_or_create_agent_memory(db, room_id, agent_config.name)
-        session_manager.hydrate_session(
-            agent_config.name,
-            room_id,
-            memory.provider_session_id,
-            memory.message_count,
-            memory.estimated_tokens,
-        )
+    if room_id and db and manage_room_memory:
+        await _hydrate_runtime_from_memory(db, room_id, agent_config.name)
+
+    if room_id:
         provider_session_id = session_manager.get_provider_session_id(
             agent_config.name,
             room_id,
@@ -394,17 +516,8 @@ async def _call_agent(
         elif session_manager.should_rotate(agent_config.name):
             session_manager.rotate_session(agent_config.name)
 
-        if db and room_id:
-            runtime_session = session_manager.get_session(agent_config.name, room_id)
-            if runtime_session:
-                await sync_agent_memory_from_runtime(
-                    db,
-                    room_id,
-                    agent_config.name,
-                    runtime_session.get("provider_session_id"),
-                    runtime_session.get("message_count", 0),
-                    runtime_session.get("estimated_tokens", 0),
-                )
+        if room_id and db and manage_room_memory:
+            await _sync_runtime_to_memory(db, room_id, agent_config.name)
 
     except (TimeoutError, RuntimeError) as e:
         logger.error(f"Agent {agent_config.name} failed: {e}")
@@ -426,6 +539,8 @@ async def _run_agent_call(
     on_status: StatusCallback | None = None,
     stream_message: Message | None = None,
     on_stream: StreamCallback | None = None,
+    *,
+    manage_room_memory: bool = True,
 ) -> tuple[AgentConfig, str]:
     if on_status:
         await on_status(agent_config.name, "working")
@@ -442,8 +557,15 @@ async def _run_agent_call(
                 on_stream=handle_stream,
                 db=db,
                 room_id=room_id,
+                manage_room_memory=manage_room_memory,
             )
-        return await _call_agent(agent_config, prompt, db=db, room_id=room_id)
+        return await _call_agent(
+            agent_config,
+            prompt,
+            db=db,
+            room_id=room_id,
+            manage_room_memory=manage_room_memory,
+        )
     finally:
         if on_status:
             await on_status(agent_config.name, "idle")
@@ -510,12 +632,15 @@ async def _build_review_prompt(
             "You are reviewing another AI agent's proposed plan or output.",
             "Focus on risks, missing steps, branch-related concerns, and concrete corrections.",
             "Do not rewrite everything from scratch unless the original plan is fundamentally broken.",
+            "Return your review using this protocol:",
+            "#artifact=review",
+            "#status=approved|revise|blocked",
             "",
             git_context,
             "",
             f"Original user request:\n{original_request}",
             "",
-            f"{primary_agent.display_name} response to review:\n{primary_response}",
+            f"{primary_agent.display_name} plan or output to review:\n{primary_response}",
             "",
             "Return a concise review with:",
             "1. Major risks",
@@ -526,6 +651,58 @@ async def _build_review_prompt(
     )
 
 
+async def _build_decision_prompt(
+    original_request: str,
+    primary_agent: AgentConfig,
+    plan_text: str,
+    review_texts: list[str],
+) -> str:
+    review_block = "\n\n".join(
+        f"Review {index + 1}:\n{text}" for index, text in enumerate(review_texts)
+    )
+    return "\n".join(
+        [
+            "You are making the final decision for a multi-agent collaboration run.",
+            "Read your original plan and the review feedback, then decide whether the work is ready.",
+            "Return your result using this protocol:",
+            "#artifact=decision",
+            "#status=completed|blocked|revise",
+            "",
+            f"Original user request:\n{original_request}",
+            "",
+            f"Your original plan:\n{plan_text}",
+            "",
+            f"Review feedback:\n{review_block}",
+            "",
+            "Return a concise final decision with:",
+            "1. Decision",
+            "2. Reasoning",
+            "3. Next action",
+        ]
+    )
+
+
+async def _persist_agent_response(
+    db: AsyncSession,
+    room_id: str,
+    transient_message: Message,
+    agent_config: AgentConfig,
+    raw_content: str,
+    extracted: ExtractedArtifact,
+) -> Message:
+    agent_message = Message(
+        id=transient_message.id,
+        room_id=room_id,
+        sender_type=agent_config.agent_type,
+        sender_name=agent_config.display_name,
+        content=extracted.clean_content,
+        created_at=transient_message.created_at,
+    )
+    db.add(agent_message)
+    await db.flush()
+    return agent_message
+
+
 async def route_message(
     message: Message,
     db: AsyncSession,
@@ -534,6 +711,8 @@ async def route_message(
     on_stream: StreamCallback | None = None,
     chain_depth: int = 0,
     agent_chain: tuple[str, ...] = (),
+    run_id: str | None = None,
+    raw_content_override: str | None = None,
 ) -> list[Message]:
     """Route an incoming message to the appropriate agents.
 
@@ -547,17 +726,23 @@ async def route_message(
         chain_depth: Current recursive depth for agent-to-agent chaining.
         agent_chain: Ordered names of agents already invoked in this route chain.
     """
+    raw_content = raw_content_override or message.content
+
+    run = await _get_collaboration_run(db, run_id)
     if chain_depth > MAX_AGENT_CHAIN_DEPTH:
         logger.warning("Agent chain depth exceeded for room %s", message.room_id)
+        if run and run.status == RUN_STATUS_RUNNING:
+            stop_run(run, RUN_STATUS_STOPPED, "max_agent_chain_depth_exceeded")
+            await db.flush()
         return []
 
     if message.sender_type == "human":
-        mentions = extract_mentions(message.content)
-        clean_content = strip_control_syntax(message.content)
+        mentions = extract_mentions(raw_content)
+        clean_content = strip_control_syntax(raw_content)
     else:
-        mentions = extract_agent_handoff_targets(message.content)
-        clean_content = extract_agent_handoff_request(message.content)
-    review_targets = extract_review_targets(message.content)
+        mentions = extract_agent_handoff_targets(raw_content)
+        clean_content = extract_agent_handoff_request(raw_content)
+    review_targets = extract_review_targets(raw_content)
 
     if not mentions:
         return []
@@ -597,21 +782,46 @@ async def route_message(
             reviewer_configs.append(agent_map[reviewer_name])
             seen_reviewers.add(reviewer_name)
 
+    run = await _get_or_create_collaboration_run(
+        db,
+        message,
+        review_targets,
+        run_id=run_id,
+    )
+    if run.status != RUN_STATUS_RUNNING:
+        return []
+
+    limit_reason = should_stop_for_limits(run)
+    if limit_reason:
+        stop_run(run, RUN_STATUS_STOPPED, limit_reason)
+        await db.flush()
+        return []
+
     prompt_request = clean_content
     if message.sender_type == "human":
         prompt_request = (
             clean_content
             + _build_human_collaboration_hint(
-                message.content,
+                raw_content,
                 enabled_agents,
                 targets,
                 review_targets,
             )
         )
+        if reviewer_configs and len(targets) == 1:
+            prompt_request = "\n".join(
+                [
+                    prompt_request,
+                    "",
+                    "Collaboration protocol:",
+                    "Return a reusable plan and begin with `#artifact=plan`.",
+                ]
+            )
 
     # Build prompt with chat history so agent can see prior conversation
     prompt_by_agent: dict[str, str] = {}
     for target in targets:
+        await _hydrate_runtime_from_memory(db, message.room_id, target.name)
         prompt_by_agent[target.name.lower()] = await _build_prompt_with_history(
             db,
             message.room_id,
@@ -636,6 +846,7 @@ async def route_message(
                 on_status,
                 stream_message=transient_message,
                 on_stream=on_stream,
+                manage_room_memory=False,
             )
         except Exception as e:
             logger.error("Agent call failed for %s: %s", cfg.name, e)
@@ -649,28 +860,45 @@ async def route_message(
     ]
     for task in asyncio.as_completed(tasks):
         transient_message, agent_config, response_text = await task
-
-        agent_message = Message(
-            id=transient_message.id,
-            room_id=message.room_id,
-            sender_type=agent_config.agent_type,
-            sender_name=agent_config.display_name,
-            content=response_text,
-            created_at=transient_message.created_at,
+        primary_extracted = extract_artifact(
+            response_text,
+            default_artifact_type="plan" if reviewer_configs else None,
         )
-        db.add(agent_message)
-        await db.flush()
+        agent_message = await _persist_agent_response(
+            db,
+            message.room_id,
+            transient_message,
+            agent_config,
+            response_text,
+            primary_extracted,
+        )
+        register_step(run)
+        await _sync_runtime_to_memory(db, message.room_id, agent_config.name)
+        await _create_agent_artifact(
+            db,
+            run,
+            agent_message,
+            agent_config.name,
+            primary_extracted,
+        )
         responses.append(agent_message)
 
         # Stream each response to clients as it arrives
         if on_response:
             await on_response(agent_message)
 
+        review_texts: list[str] = []
         for reviewer_config in reviewer_configs:
+            limit_reason = should_stop_for_limits(run)
+            if limit_reason:
+                stop_run(run, RUN_STATUS_STOPPED, limit_reason)
+                break
+
+            await _hydrate_runtime_from_memory(db, message.room_id, reviewer_config.name)
             review_prompt = await _build_review_prompt(
                 clean_content,
                 agent_config,
-                response_text,
+                primary_extracted.clean_content,
             )
             review_transient_message = _build_transient_agent_message(
                 message.room_id,
@@ -685,58 +913,168 @@ async def route_message(
                     on_status,
                     stream_message=review_transient_message,
                     on_stream=on_stream,
+                    manage_room_memory=False,
                 )
             except Exception as e:
                 logger.error(
                     "Review agent %s failed after %s response: %s",
-                    reviewer_config.name,
-                    agent_config.name,
-                    e,
+                        reviewer_config.name,
+                        agent_config.name,
+                        e,
+                    )
+                extracted_error = extract_artifact(
+                    f"#artifact=review\n#status=blocked\nAgent error: {e}",
+                    default_artifact_type="review",
+                    default_status="blocked",
                 )
                 review_message = Message(
                     id=review_transient_message.id,
                     room_id=review_transient_message.room_id,
                     sender_type=review_transient_message.sender_type,
                     sender_name=review_transient_message.sender_name,
-                    content=f"Agent error: {e}",
+                    content=extracted_error.clean_content,
                     created_at=review_transient_message.created_at,
                 )
                 db.add(review_message)
                 await db.flush()
+                register_step(run)
+                register_review_round(run)
+                await _create_agent_artifact(
+                    db,
+                    run,
+                    review_message,
+                    reviewer_config.name,
+                    extracted_error,
+                )
                 responses.append(review_message)
                 if on_response:
                     await on_response(review_message)
                 continue
 
-            review_message = Message(
-                id=review_transient_message.id,
-                room_id=message.room_id,
-                sender_type=reviewer_config.agent_type,
-                sender_name=reviewer_config.display_name,
-                content=review_text,
-                created_at=review_transient_message.created_at,
+            extracted_review = extract_artifact(
+                review_text,
+                default_artifact_type="review",
             )
-            db.add(review_message)
-            await db.flush()
+            review_message = await _persist_agent_response(
+                db,
+                room_id=message.room_id,
+                transient_message=review_transient_message,
+                agent_config=reviewer_config,
+                raw_content=review_text,
+                extracted=extracted_review,
+            )
+            register_step(run)
+            register_review_round(run)
+            await _sync_runtime_to_memory(db, message.room_id, reviewer_config.name)
+            await _create_agent_artifact(
+                db,
+                run,
+                review_message,
+                reviewer_config.name,
+                extracted_review,
+            )
             responses.append(review_message)
+            review_texts.append(extracted_review.clean_content)
 
             if on_response:
                 await on_response(review_message)
 
+        decision_raw_content: str | None = None
+        decision_message: Message | None = None
+        if reviewer_configs and run.status == RUN_STATUS_RUNNING:
+            limit_reason = should_stop_for_limits(run)
+            if limit_reason:
+                stop_run(run, RUN_STATUS_STOPPED, limit_reason)
+            else:
+                await _hydrate_runtime_from_memory(db, message.room_id, agent_config.name)
+                decision_prompt = await _build_decision_prompt(
+                    clean_content,
+                    agent_config,
+                    primary_extracted.clean_content,
+                    review_texts,
+                )
+                decision_transient_message = _build_transient_agent_message(
+                    message.room_id,
+                    agent_config,
+                )
+                try:
+                    _, decision_raw_content = await _run_agent_call(
+                        db,
+                        message.room_id,
+                        agent_config,
+                        decision_prompt,
+                        on_status,
+                        stream_message=decision_transient_message,
+                        on_stream=on_stream,
+                        manage_room_memory=False,
+                    )
+                    extracted_decision = extract_artifact(
+                        decision_raw_content,
+                        default_artifact_type="decision",
+                    )
+                except Exception as e:
+                    logger.error(
+                        "Decision step failed for %s in run %s: %s",
+                        agent_config.name,
+                        run.id,
+                        e,
+                    )
+                    decision_raw_content = f"#artifact=decision\n#status=blocked\nAgent error: {e}"
+                    extracted_decision = extract_artifact(
+                        decision_raw_content,
+                        default_artifact_type="decision",
+                        default_status="blocked",
+                    )
+
+                decision_message = await _persist_agent_response(
+                    db,
+                    message.room_id,
+                    decision_transient_message,
+                    agent_config,
+                    decision_raw_content,
+                    extracted_decision,
+                )
+                register_step(run)
+                await _sync_runtime_to_memory(db, message.room_id, agent_config.name)
+                await _create_agent_artifact(
+                    db,
+                    run,
+                    decision_message,
+                    agent_config.name,
+                    extracted_decision,
+                )
+                finalize_run_from_artifact(
+                    run,
+                    extracted_decision.artifact_type,
+                    extracted_decision.status,
+                )
+                responses.append(decision_message)
+                if on_response:
+                    await on_response(decision_message)
+
+        follow_up_message = decision_message or agent_message
+        follow_up_raw_content = decision_raw_content or response_text
         chained_agents = (
             *agent_chain,
             agent_config.name.lower(),
             *(reviewer.name.lower() for reviewer in reviewer_configs),
         )
-        chained_responses = await route_message(
-            agent_message,
-            db,
-            on_response=on_response,
-            on_status=on_status,
-            on_stream=on_stream,
-            chain_depth=chain_depth + 1,
-            agent_chain=chained_agents,
-        )
-        responses.extend(chained_responses)
+        if run.status == RUN_STATUS_RUNNING:
+            chained_responses = await route_message(
+                follow_up_message,
+                db,
+                on_response=on_response,
+                on_status=on_status,
+                on_stream=on_stream,
+                chain_depth=chain_depth + 1,
+                agent_chain=chained_agents,
+                run_id=run.id,
+                raw_content_override=follow_up_raw_content,
+            )
+            responses.extend(chained_responses)
+
+    if run.status == RUN_STATUS_RUNNING:
+        stop_run(run, RUN_STATUS_COMPLETED, "no_further_actions")
+    await db.flush()
 
     return responses

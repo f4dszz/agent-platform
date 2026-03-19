@@ -2,12 +2,14 @@ import asyncio
 import unittest
 from unittest.mock import AsyncMock, patch
 
-from sqlalchemy import event, text
+from sqlalchemy import event, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.pool import StaticPool
 
 from app.db.database import Base, engine as app_engine
 from app.models.agent import AgentConfig
+from app.models.agent_artifact import AgentArtifact
+from app.models.collaboration_run import CollaborationRun
 from app.models.message import Message
 from app.models.room import Room
 from app.services.agent_memory_store import refresh_agent_memory_summary
@@ -359,9 +361,11 @@ class RouteMessageTests(AsyncDbTestCase):
 
             async def fake_call_agent(agent_config, prompt, **_kwargs):
                 seen_prompts.append((agent_config.name, prompt))
-                if agent_config.name == "claude":
-                    return agent_config, "Primary plan"
-                return agent_config, "Review notes"
+                if agent_config.name == "codex":
+                    return agent_config, "#artifact=review\n#status=revise\nReview notes"
+                if prompt == "primary prompt":
+                    return agent_config, "#artifact=plan\nPrimary plan"
+                return agent_config, "#artifact=decision\n#status=blocked\nNeed updates"
 
             async def on_status(agent_name: str, status: str):
                 seen_statuses.append((agent_name, status))
@@ -388,9 +392,9 @@ class RouteMessageTests(AsyncDbTestCase):
 
             self.assertEqual(
                 [response.sender_name for response in responses],
-                ["Claude Code", "Codex CLI"],
+                ["Claude Code", "Codex CLI", "Claude Code"],
             )
-            self.assertEqual(seen_responses, ["Claude Code", "Codex CLI"])
+            self.assertEqual(seen_responses, ["Claude Code", "Codex CLI", "Claude Code"])
             self.assertEqual(
                 seen_statuses,
                 [
@@ -398,13 +402,35 @@ class RouteMessageTests(AsyncDbTestCase):
                     ("claude", "idle"),
                     ("codex", "working"),
                     ("codex", "idle"),
+                    ("claude", "working"),
+                    ("claude", "idle"),
                 ],
             )
             self.assertEqual(seen_prompts[0], ("claude", "primary prompt"))
             self.assertEqual(seen_prompts[1][0], "codex")
             self.assertIn("Current git branch: feature/test.", seen_prompts[1][1])
             self.assertIn("Original user request:\nrefactor auth flow", seen_prompts[1][1])
-            self.assertIn("Claude Code response to review:\nPrimary plan", seen_prompts[1][1])
+            self.assertIn("Claude Code plan or output to review:\nPrimary plan", seen_prompts[1][1])
+            self.assertEqual(seen_prompts[2][0], "claude")
+            self.assertIn("#artifact=decision", seen_prompts[2][1])
+            self.assertIn("Review feedback:\nReview 1:\nReview notes", seen_prompts[2][1])
+
+            run_result = await db.execute(select(CollaborationRun))
+            run = run_result.scalar_one()
+            self.assertEqual(run.mode, "plan_review")
+            self.assertEqual(run.status, "blocked")
+            self.assertEqual(run.step_count, 3)
+            self.assertEqual(run.review_round_count, 1)
+            self.assertEqual(run.root_message_id, message.id)
+
+            artifact_result = await db.execute(
+                select(AgentArtifact).order_by(AgentArtifact.created_at.asc())
+            )
+            artifacts = list(artifact_result.scalars().all())
+            self.assertEqual(
+                [(artifact.artifact_type, artifact.status) for artifact in artifacts],
+                [("plan", None), ("review", "revise"), ("decision", "blocked")],
+            )
 
     async def test_route_message_triggers_agent_mentions_from_agent_response(self):
         async with self.session_factory() as db:
@@ -670,8 +696,8 @@ class RouteMessageTests(AsyncDbTestCase):
 
             async def fake_call_agent(agent_config, _prompt, **_kwargs):
                 if agent_config.name == "claude":
-                    return agent_config, "Plan draft.\n@codex please review."
-                return agent_config, "Review result"
+                    return agent_config, "#artifact=plan\nPlan draft.\n@codex please review."
+                return agent_config, "#artifact=review\n#status=approved\nReview result"
 
             with patch(
                 "app.services.orchestrator._call_agent",
@@ -679,10 +705,10 @@ class RouteMessageTests(AsyncDbTestCase):
             ) as mock_call_agent:
                 responses = await route_message(message, db)
 
-            self.assertEqual(mock_call_agent.await_count, 2)
+            self.assertEqual(mock_call_agent.await_count, 3)
             self.assertEqual(
                 [response.sender_name for response in responses],
-                ["Claude Code", "Codex CLI"],
+                ["Claude Code", "Codex CLI", "Claude Code"],
             )
 
     async def test_route_message_prevents_agent_ping_pong_loops(self):
@@ -728,7 +754,6 @@ class RouteMessageTests(AsyncDbTestCase):
                 [response.sender_name for response in responses],
                 ["Claude Code", "Codex CLI"],
             )
-
 
 class SessionManagerTests(unittest.TestCase):
     def test_session_manager_tracks_concurrent_runs(self):
@@ -967,4 +992,4 @@ class ReviewPromptTests(unittest.IsolatedAsyncioTestCase):
 
         self.assertIn("Current git branch: review-branch.", prompt)
         self.assertIn("Original user request:\nrefactor service layer", prompt)
-        self.assertIn("Claude Code response to review:\nPlan text", prompt)
+        self.assertIn("Claude Code plan or output to review:\nPlan text", prompt)

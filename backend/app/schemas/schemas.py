@@ -109,3 +109,46 @@ class WSMessage(BaseModel):
     content: str | None = None
     agent_name: str | None = None  # For status updates
     status: str | None = None  # For status updates
+
+
+class CollaborationRunResponse(BaseModel):
+    id: str
+    room_id: str
+    root_message_id: str
+    initiator_type: str
+    mode: str
+    status: str
+    step_count: int
+    review_round_count: int
+    max_steps: int
+    max_review_rounds: int
+    stop_reason: str | None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class CollaborationRunList(BaseModel):
+    runs: list[CollaborationRunResponse]
+    total: int
+
+
+class AgentArtifactResponse(BaseModel):
+    id: str
+    run_id: str
+    room_id: str
+    source_message_id: str
+    agent_name: str
+    artifact_type: str
+    title: str | None
+    content: str
+    status: str | None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class AgentArtifactList(BaseModel):
+    artifacts: list[AgentArtifactResponse]
+    total: int

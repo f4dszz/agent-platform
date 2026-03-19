@@ -8,7 +8,7 @@ from sqlalchemy import select
 from app.config import get_settings
 from app.db.database import engine, async_session, Base
 from app.models import AgentConfig
-from app.routers import rooms, messages, agents
+from app.routers import rooms, messages, agents, collaboration
 from app.ws.handler import router as ws_router
 
 logging.basicConfig(level=logging.INFO)
@@ -89,6 +89,9 @@ app.add_middleware(
 app.include_router(rooms.router, prefix="/api/rooms", tags=["rooms"])
 app.include_router(messages.router, prefix="/api/messages", tags=["messages"])
 app.include_router(agents.router, prefix="/api/agents", tags=["agents"])
+app.include_router(
+    collaboration.router, prefix="/api/collaboration", tags=["collaboration"]
+)
 
 # WebSocket router
 app.include_router(ws_router)
