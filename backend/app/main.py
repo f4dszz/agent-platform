@@ -7,7 +7,7 @@ from sqlalchemy import select
 
 from app.config import get_settings
 from app.db.database import engine, async_session, Base
-from app.models.agent import AgentConfig
+from app.models import AgentConfig
 from app.routers import rooms, messages, agents
 from app.ws.handler import router as ws_router
 

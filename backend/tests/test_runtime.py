@@ -10,6 +10,7 @@ from app.db.database import Base, engine as app_engine
 from app.models.agent import AgentConfig
 from app.models.message import Message
 from app.models.room import Room
+from app.services.agent_memory_store import refresh_agent_memory_summary
 from app.services.orchestrator import (
     _build_prompt_with_history,
     _build_review_prompt,
@@ -76,6 +77,7 @@ class PromptHistoryTests(AsyncDbTestCase):
             prompt = await _build_prompt_with_history(
                 db,
                 room.id,
+                "codex",
                 "UNIQUE_CURRENT_REQUEST",
                 current.id,
             )
@@ -102,6 +104,7 @@ class PromptHistoryTests(AsyncDbTestCase):
             prompt = await _build_prompt_with_history(
                 db,
                 room.id,
+                "codex",
                 "your turn.",
                 current.id,
                 include_current_message_in_history=True,
@@ -110,6 +113,80 @@ class PromptHistoryTests(AsyncDbTestCase):
             self.assertIn("[Claude Code]: Here is a joke.", prompt)
             self.assertIn("@codex your turn.", prompt)
             self.assertIn("Now respond to this request: your turn.", prompt)
+
+    async def test_build_prompt_includes_persisted_long_term_memory(self):
+        async with self.session_factory() as db:
+            room = Room(name="long-memory-room", description="Refactor the auth area safely.")
+            db.add(room)
+            await db.flush()
+
+            for index in range(6):
+                db.add(
+                    Message(
+                        room_id=room.id,
+                        sender_type="human",
+                        sender_name="User",
+                        content=f"historical note {index}",
+                    )
+                )
+            await db.flush()
+
+            memory = await refresh_agent_memory_summary(db, room.id, "codex", max_recent_messages=2)
+            memory.pinned_memory = "Keep compatibility with the existing API."
+            await db.commit()
+
+            prompt = await _build_prompt_with_history(
+                db,
+                room.id,
+                "codex",
+                "propose the next change",
+                "missing-current-message",
+                max_messages=2,
+            )
+
+            self.assertIn("--- LONG-TERM MEMORY ---", prompt)
+            self.assertIn("Room brief:", prompt)
+            self.assertIn("Refactor the auth area safely.", prompt)
+            self.assertIn("Pinned long-term memory:", prompt)
+            self.assertIn("Keep compatibility with the existing API.", prompt)
+            self.assertIn("Earlier room context summary:", prompt)
+            self.assertIn("- [User] historical note 0", prompt)
+            self.assertIn("- [User] historical note 3", prompt)
+            self.assertNotIn("- [User] historical note 4", prompt)
+            self.assertIn("[User]: historical note 4", prompt)
+            self.assertIn("[User]: historical note 5", prompt)
+
+    async def test_refresh_agent_memory_summary_persists_room_digest(self):
+        async with self.session_factory() as db:
+            room = Room(name="memory-digest-room")
+            db.add(room)
+            await db.flush()
+
+            for index in range(5):
+                db.add(
+                    Message(
+                        room_id=room.id,
+                        sender_type="human",
+                        sender_name="User",
+                        content=f"step {index}",
+                    )
+                )
+            await db.flush()
+
+            memory = await refresh_agent_memory_summary(db, room.id, "claude", max_recent_messages=2)
+            await db.commit()
+
+            self.assertEqual(memory.summary_message_count, 3)
+            self.assertEqual(
+                memory.memory_summary,
+                "\n".join(
+                    [
+                        "- [User] step 0",
+                        "- [User] step 1",
+                        "- [User] step 2",
+                    ]
+                ),
+            )
 
     def test_review_directive_helpers(self):
         content = "@claude refactor auth #review-by=codex, claude, codex"
@@ -224,7 +301,7 @@ class RouteMessageTests(AsyncDbTestCase):
             db.add(message)
             await db.flush()
 
-            async def fake_call_agent(agent_config, prompt):
+            async def fake_call_agent(agent_config, prompt, **_kwargs):
                 delay = 0.05 if agent_config.name == "claude" else 0.01
                 await asyncio.sleep(delay)
                 return agent_config, f"{agent_config.name}-response"
@@ -280,7 +357,7 @@ class RouteMessageTests(AsyncDbTestCase):
             seen_statuses: list[tuple[str, str]] = []
             seen_responses: list[str] = []
 
-            async def fake_call_agent(agent_config, prompt):
+            async def fake_call_agent(agent_config, prompt, **_kwargs):
                 seen_prompts.append((agent_config.name, prompt))
                 if agent_config.name == "claude":
                     return agent_config, "Primary plan"
@@ -359,7 +436,7 @@ class RouteMessageTests(AsyncDbTestCase):
             seen_prompts: list[tuple[str, str]] = []
             seen_statuses: list[tuple[str, str]] = []
 
-            async def fake_call_agent(agent_config, prompt):
+            async def fake_call_agent(agent_config, prompt, **_kwargs):
                 seen_prompts.append((agent_config.name, prompt))
                 if agent_config.name == "claude":
                     return agent_config, "Joke body.\n@codex continue in Chinese."
@@ -424,7 +501,7 @@ class RouteMessageTests(AsyncDbTestCase):
             db.add(message)
             await db.flush()
 
-            async def fake_call_agent(agent_config, _prompt):
+            async def fake_call_agent(agent_config, _prompt, **_kwargs):
                 return agent_config, "You can also ask @codex for a second opinion."
 
             with patch(
@@ -466,7 +543,7 @@ class RouteMessageTests(AsyncDbTestCase):
             db.add(message)
             await db.flush()
 
-            async def fake_call_agent(agent_config, _prompt):
+            async def fake_call_agent(agent_config, _prompt, **_kwargs):
                 if agent_config.name == "claude":
                     return agent_config, "Plan draft.\n#handoff=codex\nReview this."
                 return agent_config, "Review result"
@@ -512,7 +589,7 @@ class RouteMessageTests(AsyncDbTestCase):
 
             seen_prompts: list[str] = []
 
-            async def fake_call_agent(agent_config, prompt):
+            async def fake_call_agent(agent_config, prompt, **_kwargs):
                 seen_prompts.append(prompt)
                 return agent_config, "Plan draft"
 
@@ -591,7 +668,7 @@ class RouteMessageTests(AsyncDbTestCase):
             db.add(message)
             await db.flush()
 
-            async def fake_call_agent(agent_config, _prompt):
+            async def fake_call_agent(agent_config, _prompt, **_kwargs):
                 if agent_config.name == "claude":
                     return agent_config, "Plan draft.\n@codex please review."
                 return agent_config, "Review result"
@@ -635,7 +712,7 @@ class RouteMessageTests(AsyncDbTestCase):
             db.add(message)
             await db.flush()
 
-            async def fake_call_agent(agent_config, prompt):
+            async def fake_call_agent(agent_config, prompt, **_kwargs):
                 if agent_config.name == "claude":
                     return agent_config, "@codex continue"
                 return agent_config, "@claude continue back"
@@ -749,6 +826,100 @@ class AgentSessionReuseTests(unittest.IsolatedAsyncioTestCase):
             captured_system_prompts[0],
         )
 
+    async def test_call_agent_isolates_provider_sessions_per_room(self):
+        captured_calls: list[tuple[str, str | None]] = []
+        room_provider_ids = {
+            "room-a": "provider-session-room-a",
+            "room-b": "provider-session-room-b",
+        }
+
+        class FakeClaudeAgent:
+            def __init__(self, **_kwargs):
+                self._last_session_id = None
+
+            @property
+            def last_session_id(self):
+                return self._last_session_id
+
+            async def send(self, prompt, session_id=None):
+                room_marker = "room-a" if "ROOM_A" in prompt else "room-b"
+                captured_calls.append((room_marker, session_id))
+                self._last_session_id = session_id or room_provider_ids[room_marker]
+                return f"ok-{room_marker}"
+
+        engine = create_async_engine(
+            "sqlite+aiosqlite:///:memory:",
+            connect_args={"check_same_thread": False},
+            poolclass=StaticPool,
+        )
+
+        @event.listens_for(engine.sync_engine, "connect")
+        def _enable_foreign_keys(dbapi_connection, _connection_record):
+            cursor = dbapi_connection.cursor()
+            cursor.execute("PRAGMA foreign_keys=ON")
+            cursor.close()
+
+        session_factory = async_sessionmaker(
+            engine, class_=AsyncSession, expire_on_commit=False
+        )
+
+        async with engine.begin() as conn:
+            await conn.run_sync(Base.metadata.create_all)
+
+        async with session_factory() as db:
+            room_a = Room(name="room-a")
+            room_b = Room(name="room-b")
+            db.add_all([room_a, room_b])
+            await db.flush()
+
+            agent = AgentConfig(
+                name="claude-reuse",
+                display_name="Claude Code",
+                agent_type="claude",
+                command="claude",
+            )
+            db.add(agent)
+            await db.flush()
+
+            session_manager.clear_session(agent.name, room_a.id)
+            session_manager.clear_session(agent.name, room_b.id)
+
+            with patch.dict(
+                "app.services.orchestrator.AGENT_CLASSES",
+                {"claude": FakeClaudeAgent},
+                clear=False,
+            ):
+                await _call_agent(agent, "ROOM_A first prompt", db=db, room_id=room_a.id)
+                await _call_agent(agent, "ROOM_B first prompt", db=db, room_id=room_b.id)
+                await _call_agent(agent, "ROOM_A second prompt", db=db, room_id=room_a.id)
+
+            result = await db.execute(
+                text(
+                    "SELECT room_id, provider_session_id, message_count "
+                    "FROM agent_memories WHERE agent_name = 'claude-reuse' ORDER BY room_id"
+                )
+            )
+            rows = result.all()
+
+            self.assertEqual(
+                captured_calls,
+                [
+                    ("room-a", None),
+                    ("room-b", None),
+                    ("room-a", "provider-session-room-a"),
+                ],
+            )
+            self.assertEqual(len(rows), 2)
+            self.assertEqual(
+                {row.provider_session_id for row in rows},
+                set(room_provider_ids.values()),
+            )
+            self.assertEqual({row.message_count for row in rows}, {1, 2})
+
+        session_manager.clear_session("claude-reuse", room_a.id)
+        session_manager.clear_session("claude-reuse", room_b.id)
+        await engine.dispose()
+
 
 class DatabaseAndRoomValidationTests(AsyncDbTestCase):
     async def test_sqlite_foreign_keys_are_enabled_on_app_engine(self):
@@ -764,6 +935,16 @@ class DatabaseAndRoomValidationTests(AsyncDbTestCase):
 
             self.assertTrue(await _room_exists(db, room.id))
             self.assertFalse(await _room_exists(db, "missing-room"))
+
+    async def test_agent_memory_table_exists_in_database_metadata(self):
+        async with self.session_factory() as db:
+            result = await db.execute(
+                text(
+                    "SELECT name FROM sqlite_master "
+                    "WHERE type = 'table' AND name = 'agent_memories'"
+                )
+            )
+            self.assertEqual(result.scalar(), "agent_memories")
 
 
 class ReviewPromptTests(unittest.IsolatedAsyncioTestCase):
@@ -787,4 +968,3 @@ class ReviewPromptTests(unittest.IsolatedAsyncioTestCase):
         self.assertIn("Current git branch: review-branch.", prompt)
         self.assertIn("Original user request:\nrefactor service layer", prompt)
         self.assertIn("Claude Code response to review:\nPlan text", prompt)
-

@@ -23,6 +23,9 @@ class Room(Base):
     messages: Mapped[list["Message"]] = relationship(  # noqa: F821
         back_populates="room", cascade="all, delete-orphan", lazy="selectin"
     )
+    agent_memories: Mapped[list["AgentMemory"]] = relationship(  # noqa: F821
+        back_populates="room", cascade="all, delete-orphan", lazy="selectin"
+    )
 
     def __repr__(self) -> str:
         return f"<Room {self.name}>"

@@ -21,6 +21,11 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import AgentConfig
 from app.models.message import Message
+from app.services.agent_memory_store import (
+    build_agent_memory_context,
+    get_or_create_agent_memory,
+    sync_agent_memory_from_runtime,
+)
 from app.services.claude_agent import ClaudeAgent
 from app.services.codex_agent import CodexAgent
 from app.services.session_manager import session_manager
@@ -237,6 +242,7 @@ async def get_enabled_agents(db: AsyncSession) -> list[AgentConfig]:
 async def _build_prompt_with_history(
     db: AsyncSession,
     room_id: str,
+    agent_name: str,
     current_content: str,
     current_message_id: str,
     include_current_message_in_history: bool = False,
@@ -256,15 +262,51 @@ async def _build_prompt_with_history(
     history.reverse()  # chronological order
 
     if not history:
-        return current_content
+        memory_context = await build_agent_memory_context(
+            db,
+            room_id,
+            agent_name,
+            max_messages,
+        )
+        if not memory_context:
+            return current_content
+        return "\n".join(
+            [
+                "Below is the persistent long-term memory for this room.",
+                "",
+                memory_context,
+                "",
+                f"Now respond to this request: {current_content}",
+            ]
+        )
+
+    memory_context = await build_agent_memory_context(
+        db,
+        room_id,
+        agent_name,
+        max_messages,
+    )
 
     lines = [
         "Below is the conversation history from a shared chat room. "
         "Multiple users and AI agents participate. "
         "Read the history for context, then respond ONLY to the current request at the end.",
         "",
-        "--- CONVERSATION HISTORY ---",
     ]
+    if memory_context:
+        lines.extend(
+            [
+                "--- LONG-TERM MEMORY ---",
+                memory_context,
+                "--- END LONG-TERM MEMORY ---",
+                "",
+            ]
+        )
+    lines.extend(
+        [
+        "--- CONVERSATION HISTORY ---",
+        ]
+    )
     for msg in history:
         lines.append(f"[{msg.sender_name}]: {msg.content}")
     lines.append("--- END HISTORY ---")
@@ -278,6 +320,9 @@ async def _call_agent(
     agent_config: AgentConfig,
     prompt: str,
     on_stream: Callable[[str], Awaitable[None]] | None = None,
+    *,
+    db: AsyncSession | None = None,
+    room_id: str | None = None,
 ) -> tuple[AgentConfig, str]:
     """Call a single agent and return (config, response_text)."""
     agent_class = AGENT_CLASSES.get(agent_config.agent_type)
@@ -298,9 +343,24 @@ async def _call_agent(
         system_prompt=effective_system_prompt,
     )
 
-    session_manager.get_or_create_session(agent_config.name)
-    provider_session_id = session_manager.get_provider_session_id(agent_config.name)
-    session_manager.start_run(agent_config.name)
+    if db and room_id:
+        memory = await get_or_create_agent_memory(db, room_id, agent_config.name)
+        session_manager.hydrate_session(
+            agent_config.name,
+            room_id,
+            memory.provider_session_id,
+            memory.message_count,
+            memory.estimated_tokens,
+        )
+        provider_session_id = session_manager.get_provider_session_id(
+            agent_config.name,
+            room_id,
+        )
+        session_manager.start_run(agent_config.name, room_id)
+    else:
+        session_manager.get_or_create_session(agent_config.name)
+        provider_session_id = session_manager.get_provider_session_id(agent_config.name)
+        session_manager.start_run(agent_config.name)
 
     try:
         if on_stream:
@@ -312,24 +372,55 @@ async def _call_agent(
         else:
             response_text = await agent.send(prompt, session_id=provider_session_id)
         if agent.last_session_id:
-            session_manager.set_provider_session_id(
-                agent_config.name, agent.last_session_id
-            )
-        session_manager.increment_messages(agent_config.name)
+            if room_id:
+                session_manager.set_provider_session_id(
+                    agent_config.name,
+                    agent.last_session_id,
+                    room_id,
+                )
+            else:
+                session_manager.set_provider_session_id(
+                    agent_config.name,
+                    agent.last_session_id,
+                )
+        if room_id:
+            session_manager.increment_messages(agent_config.name, room_id=room_id)
+        else:
+            session_manager.increment_messages(agent_config.name)
 
-        if session_manager.should_rotate(agent_config.name):
+        if room_id:
+            if session_manager.should_rotate(agent_config.name, room_id):
+                session_manager.rotate_session(agent_config.name, room_id)
+        elif session_manager.should_rotate(agent_config.name):
             session_manager.rotate_session(agent_config.name)
+
+        if db and room_id:
+            runtime_session = session_manager.get_session(agent_config.name, room_id)
+            if runtime_session:
+                await sync_agent_memory_from_runtime(
+                    db,
+                    room_id,
+                    agent_config.name,
+                    runtime_session.get("provider_session_id"),
+                    runtime_session.get("message_count", 0),
+                    runtime_session.get("estimated_tokens", 0),
+                )
 
     except (TimeoutError, RuntimeError) as e:
         logger.error(f"Agent {agent_config.name} failed: {e}")
         response_text = f"Agent error: {e}"
     finally:
-        session_manager.finish_run(agent_config.name)
+        if room_id:
+            session_manager.finish_run(agent_config.name, room_id)
+        else:
+            session_manager.finish_run(agent_config.name)
 
     return agent_config, response_text
 
 
 async def _run_agent_call(
+    db: AsyncSession,
+    room_id: str,
     agent_config: AgentConfig,
     prompt: str,
     on_status: StatusCallback | None = None,
@@ -349,8 +440,10 @@ async def _run_agent_call(
                 agent_config,
                 prompt,
                 on_stream=handle_stream,
+                db=db,
+                room_id=room_id,
             )
-        return await _call_agent(agent_config, prompt)
+        return await _call_agent(agent_config, prompt, db=db, room_id=room_id)
     finally:
         if on_status:
             await on_status(agent_config.name, "idle")
@@ -517,13 +610,16 @@ async def route_message(
         )
 
     # Build prompt with chat history so agent can see prior conversation
-    prompt_with_history = await _build_prompt_with_history(
-        db,
-        message.room_id,
-        prompt_request,
-        message.id,
-        include_current_message_in_history=message.sender_type != "human",
-    )
+    prompt_by_agent: dict[str, str] = {}
+    for target in targets:
+        prompt_by_agent[target.name.lower()] = await _build_prompt_with_history(
+            db,
+            message.room_id,
+            target.name,
+            prompt_request,
+            message.id,
+            include_current_message_in_history=message.sender_type != "human",
+        )
 
     responses: list[Message] = []
 
@@ -533,8 +629,10 @@ async def route_message(
     ) -> tuple[Message, AgentConfig, str]:
         try:
             agent_config, response_text = await _run_agent_call(
+                db,
+                message.room_id,
                 cfg,
-                prompt_with_history,
+                prompt_by_agent[cfg.name.lower()],
                 on_status,
                 stream_message=transient_message,
                 on_stream=on_stream,
@@ -580,6 +678,8 @@ async def route_message(
             )
             try:
                 _, review_text = await _run_agent_call(
+                    db,
+                    message.room_id,
                     reviewer_config,
                     review_prompt,
                     on_status,

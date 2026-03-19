@@ -71,7 +71,7 @@ async def get_agent_status(agent_name: str, db: AsyncSession = Depends(get_db)):
     # Import here to avoid circular imports
     from app.services.session_manager import session_manager
 
-    session = session_manager.get_session(agent_name)
+    session = session_manager.get_agent_status(agent_name)
     status = "idle"
     session_id = None
     message_count = 0
