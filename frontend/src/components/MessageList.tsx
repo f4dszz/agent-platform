@@ -1,6 +1,7 @@
 import { useRef, useEffect } from "react";
 import type { Message } from "../types";
 import { useTheme, t, bubbleClasses } from "./ThemeContext";
+import MarkdownContent from "./MarkdownContent";
 
 interface MessageListProps {
   messages: Message[];
@@ -84,9 +85,7 @@ export default function MessageList({ messages, typingAgents }: MessageListProps
                   {new Date(msg.created_at).toLocaleTimeString()}
                 </span>
               </div>
-              <div className={`${tk.text} text-sm whitespace-pre-wrap break-words leading-relaxed`}>
-                {msg.content}
-              </div>
+              <MarkdownContent content={msg.content} />
             </div>
           </div>
         );
