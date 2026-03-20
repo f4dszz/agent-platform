@@ -57,17 +57,25 @@ class AgentRegister(BaseModel):
     display_name: str = Field(..., max_length=100)
     agent_type: str = Field(..., pattern=r"^(claude|codex)$")
     command: str = Field(..., max_length=500)
+    model: str | None = Field(default=None, max_length=120)
     default_args: str | None = None
     max_timeout: int = Field(default=300, ge=10, le=3600)
     permission_mode: str = Field(default="acceptEdits", max_length=30)
     allowed_tools: str | None = None
+    avatar_label: str | None = Field(default=None, max_length=8)
+    avatar_color: str | None = Field(default=None, max_length=40)
     system_prompt: str | None = None
 
 
 class AgentUpdate(BaseModel):
     display_name: str | None = None
+    command: str | None = Field(default=None, max_length=500)
+    model: str | None = Field(default=None, max_length=120)
+    default_args: str | None = None
     permission_mode: str | None = None
     allowed_tools: str | None = None
+    avatar_label: str | None = Field(default=None, max_length=8)
+    avatar_color: str | None = Field(default=None, max_length=40)
     system_prompt: str | None = None
     max_timeout: int | None = Field(default=None, ge=10, le=3600)
 
@@ -78,11 +86,14 @@ class AgentResponse(BaseModel):
     display_name: str
     agent_type: str
     command: str
+    model: str | None
     default_args: str | None
     enabled: bool
     max_timeout: int
     permission_mode: str
     allowed_tools: str | None
+    avatar_label: str | None
+    avatar_color: str | None
     system_prompt: str | None
     created_at: datetime
 
@@ -151,4 +162,70 @@ class AgentArtifactResponse(BaseModel):
 
 class AgentArtifactList(BaseModel):
     artifacts: list[AgentArtifactResponse]
+    total: int
+
+
+class RunStepResponse(BaseModel):
+    id: str
+    run_id: str
+    room_id: str
+    source_message_id: str | None
+    agent_name: str | None
+    step_type: str
+    status: str
+    title: str | None
+    content: str | None
+    metadata_json: str | None
+    created_at: datetime
+    updated_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class RunStepList(BaseModel):
+    steps: list[RunStepResponse]
+    total: int
+
+
+class AgentEventResponse(BaseModel):
+    id: str
+    run_id: str
+    room_id: str
+    step_id: str | None
+    source_message_id: str | None
+    agent_name: str | None
+    event_type: str
+    content: str | None
+    payload_json: str | None
+    created_at: datetime
+
+    model_config = {"from_attributes": True}
+
+
+class AgentEventList(BaseModel):
+    events: list[AgentEventResponse]
+    total: int
+
+
+class ApprovalRequestResponse(BaseModel):
+    id: str
+    run_id: str
+    room_id: str
+    step_id: str | None
+    source_message_id: str | None
+    agent_name: str
+    requested_permission_mode: str
+    status: str
+    reason: str
+    resume_kind: str | None
+    resume_payload: str | None
+    error_text: str | None
+    created_at: datetime
+    resolved_at: datetime | None
+
+    model_config = {"from_attributes": True}
+
+
+class ApprovalRequestList(BaseModel):
+    approvals: list[ApprovalRequestResponse]
     total: int

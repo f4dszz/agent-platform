@@ -24,10 +24,13 @@ async def register_agent(body: AgentRegister, db: AsyncSession = Depends(get_db)
         display_name=body.display_name,
         agent_type=body.agent_type,
         command=body.command,
+        model=body.model,
         default_args=body.default_args,
         max_timeout=body.max_timeout,
         permission_mode=body.permission_mode,
         allowed_tools=body.allowed_tools,
+        avatar_label=body.avatar_label,
+        avatar_color=body.avatar_color,
         system_prompt=body.system_prompt,
     )
     db.add(agent)

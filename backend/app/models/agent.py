@@ -1,7 +1,7 @@
 import uuid
 from datetime import datetime, timezone
 
-from sqlalchemy import String, DateTime, Text, Boolean, Integer
+from sqlalchemy import Boolean, DateTime, Integer, String, Text
 from sqlalchemy.orm import Mapped, mapped_column
 
 from app.db.database import Base
@@ -25,6 +25,9 @@ class AgentConfig(Base):
     command: Mapped[str] = mapped_column(
         String(500), nullable=False
     )  # CLI command path
+    model: Mapped[str | None] = mapped_column(
+        String(120), nullable=True
+    )  # Provider model identifier
     default_args: Mapped[str | None] = mapped_column(
         Text, nullable=True
     )  # JSON string of default arguments
@@ -37,10 +40,16 @@ class AgentConfig(Base):
     )  # "default", "acceptEdits", "plan", "bypassPermissions"
     allowed_tools: Mapped[str | None] = mapped_column(
         Text, nullable=True
-    )  # 逗号分隔: "Read,Glob,Grep,Edit,Write,Bash" 或 null=全部
+    )  # Comma-separated: "Read,Glob,Grep,Edit,Write,Bash"; null = all
+    avatar_label: Mapped[str | None] = mapped_column(
+        String(8), nullable=True
+    )  # Short text rendered inside the avatar chip
+    avatar_color: Mapped[str | None] = mapped_column(
+        String(40), nullable=True
+    )  # Hex/rgb CSS color used for the avatar background
     system_prompt: Mapped[str | None] = mapped_column(
         Text, nullable=True
-    )  # 人格提示词
+    )  # Persona / collaboration prompt
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)
     )

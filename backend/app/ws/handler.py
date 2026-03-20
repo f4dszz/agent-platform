@@ -1,5 +1,6 @@
 """WebSocket handler for real-time room messaging."""
 
+import asyncio
 import json
 import logging
 
@@ -8,8 +9,13 @@ from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 
 from app.db.database import async_session
+from app.models.agent_artifact import AgentArtifact
+from app.models.agent_event import AgentEvent
+from app.models.approval_request import ApprovalRequest
+from app.models.collaboration_run import CollaborationRun
 from app.models.message import Message
 from app.models.room import Room
+from app.models.run_step import RunStep
 from app.services.orchestrator import route_message
 
 logger = logging.getLogger(__name__)
@@ -20,12 +26,14 @@ router = APIRouter()
 class ConnectionManager:
     def __init__(self):
         self._rooms: dict[str, set[WebSocket]] = {}
+        self._send_locks: dict[WebSocket, asyncio.Lock] = {}
 
     async def connect(self, websocket: WebSocket, room_id: str) -> None:
         await websocket.accept()
         if room_id not in self._rooms:
             self._rooms[room_id] = set()
         self._rooms[room_id].add(websocket)
+        self._send_locks.setdefault(websocket, asyncio.Lock())
         logger.info("WS connect room=%s total=%s", room_id, len(self._rooms[room_id]))
 
     def disconnect(self, websocket: WebSocket, room_id: str) -> None:
@@ -33,19 +41,24 @@ class ConnectionManager:
             self._rooms[room_id].discard(websocket)
             if not self._rooms[room_id]:
                 del self._rooms[room_id]
+        self._send_locks.pop(websocket, None)
 
     async def broadcast(self, room_id: str, data: dict) -> None:
         if room_id not in self._rooms:
             return
         payload = json.dumps(data)
         dead = set()
-        for ws in self._rooms[room_id]:
+        for ws in list(self._rooms[room_id]):
             try:
-                await ws.send_text(payload)
+                lock = self._send_locks.setdefault(ws, asyncio.Lock())
+                async with lock:
+                    await ws.send_text(payload)
             except Exception:
+                logger.warning("WS broadcast failed room=%s", room_id, exc_info=True)
                 dead.add(ws)
         for ws in dead:
             self._rooms[room_id].discard(ws)
+            self._send_locks.pop(ws, None)
 
 
 manager = ConnectionManager()
@@ -77,6 +90,95 @@ def stream_chunk_to_dict(msg: Message, content: str) -> dict:
         "sender_name": msg.sender_name,
         "content": content,
         "created_at": msg.created_at.isoformat() if msg.created_at else None,
+    }
+
+
+def run_to_dict(run: CollaborationRun) -> dict:
+    return {
+        "type": "run_update",
+        "id": run.id,
+        "room_id": run.room_id,
+        "root_message_id": run.root_message_id,
+        "initiator_type": run.initiator_type,
+        "mode": run.mode,
+        "status": run.status,
+        "step_count": run.step_count,
+        "review_round_count": run.review_round_count,
+        "max_steps": run.max_steps,
+        "max_review_rounds": run.max_review_rounds,
+        "stop_reason": run.stop_reason,
+        "created_at": run.created_at.isoformat() if run.created_at else None,
+        "updated_at": run.updated_at.isoformat() if run.updated_at else None,
+    }
+
+
+def artifact_to_dict(artifact: AgentArtifact) -> dict:
+    return {
+        "type": "artifact",
+        "id": artifact.id,
+        "run_id": artifact.run_id,
+        "room_id": artifact.room_id,
+        "source_message_id": artifact.source_message_id,
+        "agent_name": artifact.agent_name,
+        "artifact_type": artifact.artifact_type,
+        "title": artifact.title,
+        "content": artifact.content,
+        "status": artifact.status,
+        "created_at": artifact.created_at.isoformat() if artifact.created_at else None,
+    }
+
+
+def run_step_to_dict(step: RunStep) -> dict:
+    return {
+        "type": "run_step",
+        "id": step.id,
+        "run_id": step.run_id,
+        "room_id": step.room_id,
+        "source_message_id": step.source_message_id,
+        "agent_name": step.agent_name,
+        "step_type": step.step_type,
+        "status": step.status,
+        "title": step.title,
+        "content": step.content,
+        "metadata_json": step.metadata_json,
+        "created_at": step.created_at.isoformat() if step.created_at else None,
+        "updated_at": step.updated_at.isoformat() if step.updated_at else None,
+    }
+
+
+def agent_event_to_dict(event: AgentEvent) -> dict:
+    return {
+        "type": "agent_event",
+        "id": event.id,
+        "run_id": event.run_id,
+        "room_id": event.room_id,
+        "step_id": event.step_id,
+        "source_message_id": event.source_message_id,
+        "agent_name": event.agent_name,
+        "event_type": event.event_type,
+        "content": event.content,
+        "payload_json": event.payload_json,
+        "created_at": event.created_at.isoformat() if event.created_at else None,
+    }
+
+
+def approval_to_dict(approval: ApprovalRequest) -> dict:
+    return {
+        "type": "approval_request",
+        "id": approval.id,
+        "run_id": approval.run_id,
+        "room_id": approval.room_id,
+        "step_id": approval.step_id,
+        "source_message_id": approval.source_message_id,
+        "agent_name": approval.agent_name,
+        "requested_permission_mode": approval.requested_permission_mode,
+        "status": approval.status,
+        "reason": approval.reason,
+        "resume_kind": approval.resume_kind,
+        "resume_payload": approval.resume_payload,
+        "error_text": approval.error_text,
+        "created_at": approval.created_at.isoformat() if approval.created_at else None,
+        "resolved_at": approval.resolved_at.isoformat() if approval.resolved_at else None,
     }
 
 
@@ -156,12 +258,32 @@ async def websocket_endpoint(websocket: WebSocket, room_id: str):
                                 stream_chunk_to_dict(stream_msg, content),
                             )
 
+                        async def on_run_update(run: CollaborationRun):
+                            await manager.broadcast(room_id, run_to_dict(run))
+
+                        async def on_artifact(artifact: AgentArtifact):
+                            await manager.broadcast(room_id, artifact_to_dict(artifact))
+
+                        async def on_run_step(step: RunStep):
+                            await manager.broadcast(room_id, run_step_to_dict(step))
+
+                        async def on_agent_event(event: AgentEvent):
+                            await manager.broadcast(room_id, agent_event_to_dict(event))
+
+                        async def on_approval(approval: ApprovalRequest):
+                            await manager.broadcast(room_id, approval_to_dict(approval))
+
                         await route_message(
                             message,
                             db,
                             on_response=on_agent_response,
                             on_status=on_agent_status,
                             on_stream=on_agent_stream,
+                            on_run_update=on_run_update,
+                            on_artifact=on_artifact,
+                            on_step=on_run_step,
+                            on_event=on_agent_event,
+                            on_approval=on_approval,
                         )
                         await db.commit()
                     except Exception as e:

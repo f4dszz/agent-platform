@@ -1,6 +1,6 @@
 import { useState, useEffect } from "react";
 import type { Room } from "./types";
-import { listRooms, createRoom, listAgents } from "./services/api";
+import { listRooms, createRoom, deleteRoom, listAgents } from "./services/api";
 import { ThemeProvider, useTheme, t } from "./components/ThemeContext";
 import RoomSidebar from "./components/RoomSidebar";
 import ChatRoom from "./components/ChatRoom";
@@ -13,6 +13,7 @@ function AppInner() {
   const [agentStatuses, setAgentStatuses] = useState<
     Record<string, "idle" | "working" | "offline">
   >({});
+  const [agentConfigVersion, setAgentConfigVersion] = useState(0);
 
   useEffect(() => {
     listRooms().then((data) => {
@@ -23,8 +24,8 @@ function AppInner() {
     });
     listAgents().then((agents) => {
       const initial: Record<string, "idle" | "working" | "offline"> = {};
-      for (const a of agents) {
-        initial[a.name] = a.enabled ? "idle" : "offline";
+      for (const agent of agents) {
+        initial[agent.name] = agent.enabled ? "idle" : "offline";
       }
       setAgentStatuses(initial);
     });
@@ -36,7 +37,19 @@ function AppInner() {
     setSelectedRoomId(room.id);
   };
 
-  const selectedRoom = rooms.find((r) => r.id === selectedRoomId);
+  const handleDeleteRoom = async (roomId: string) => {
+    await deleteRoom(roomId);
+    setRooms((prev) => {
+      const next = prev.filter((room) => room.id !== roomId);
+      setSelectedRoomId((current) => {
+        if (current !== roomId) return current;
+        return next[0]?.id ?? null;
+      });
+      return next;
+    });
+  };
+
+  const selectedRoom = rooms.find((room) => room.id === selectedRoomId);
 
   return (
     <div className={`flex h-screen ${tk.bg} ${tk.text}`}>
@@ -45,7 +58,12 @@ function AppInner() {
         selectedRoomId={selectedRoomId}
         onSelectRoom={setSelectedRoomId}
         onCreateRoom={handleCreateRoom}
+        onDeleteRoom={handleDeleteRoom}
         agentStatuses={agentStatuses}
+        onAgentStatusPatch={(name, status) =>
+          setAgentStatuses((prev) => ({ ...prev, [name]: status }))
+        }
+        onAgentConfigChange={() => setAgentConfigVersion((prev) => prev + 1)}
       />
 
       <main className="flex-1 flex flex-col">
@@ -54,12 +72,13 @@ function AppInner() {
             key={selectedRoom.id}
             roomId={selectedRoom.id}
             roomName={selectedRoom.name}
+            agentConfigVersion={agentConfigVersion}
             onAgentStatusChange={setAgentStatuses}
           />
         ) : (
           <div className={`flex-1 flex items-center justify-center ${tk.textMuted} ${tk.bg}`}>
             <div className="text-center">
-              <div className="text-5xl mb-5 opacity-40">💬</div>
+              <div className="text-5xl mb-5 opacity-40">Chat</div>
               <p className={`text-lg font-medium ${tk.textSecondary}`}>
                 Select or create a room
               </p>

@@ -40,6 +40,15 @@ class CollaborationRun(Base):
     artifacts: Mapped[list["AgentArtifact"]] = relationship(  # noqa: F821
         back_populates="run", cascade="all, delete-orphan", lazy="selectin"
     )
+    steps: Mapped[list["RunStep"]] = relationship(  # noqa: F821
+        back_populates="run", cascade="all, delete-orphan", lazy="selectin"
+    )
+    events: Mapped[list["AgentEvent"]] = relationship(  # noqa: F821
+        back_populates="run", cascade="all, delete-orphan", lazy="selectin"
+    )
+    approval_requests: Mapped[list["ApprovalRequest"]] = relationship(  # noqa: F821
+        back_populates="run", cascade="all, delete-orphan", lazy="selectin"
+    )
 
     def __repr__(self) -> str:
         return f"<CollaborationRun room={self.room_id} status={self.status} mode={self.mode}>"

@@ -17,17 +17,22 @@ export interface Message {
   streaming?: boolean;
 }
 
+export type MessageSenderType = Message["sender_type"];
+
 export interface Agent {
   id: string;
   name: string;
   display_name: string;
   agent_type: "claude" | "codex";
   command: string;
+  model: string | null;
   default_args: string | null;
   enabled: boolean;
   max_timeout: number;
   permission_mode: string;
   allowed_tools: string | null;
+  avatar_label: string | null;
+  avatar_color: string | null;
   system_prompt: string | null;
   created_at: string;
 }
@@ -40,12 +45,86 @@ export interface AgentStatus {
   message_count: number;
 }
 
+export interface CollaborationRun {
+  id: string;
+  room_id: string;
+  root_message_id: string;
+  initiator_type: string;
+  mode: string;
+  status: "running" | "blocked" | "completed" | "stopped" | "failed";
+  step_count: number;
+  review_round_count: number;
+  max_steps: number;
+  max_review_rounds: number;
+  stop_reason: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AgentArtifact {
+  id: string;
+  run_id: string;
+  room_id: string;
+  source_message_id: string;
+  agent_name: string;
+  artifact_type: string;
+  title: string | null;
+  content: string;
+  status: string | null;
+  created_at: string;
+}
+
+export interface RunStep {
+  id: string;
+  run_id: string;
+  room_id: string;
+  source_message_id: string | null;
+  agent_name: string | null;
+  step_type: string;
+  status: string;
+  title: string | null;
+  content: string | null;
+  metadata_json: string | null;
+  created_at: string;
+  updated_at: string;
+}
+
+export interface AgentEvent {
+  id: string;
+  run_id: string;
+  room_id: string;
+  step_id: string | null;
+  source_message_id: string | null;
+  agent_name: string | null;
+  event_type: string;
+  content: string | null;
+  payload_json: string | null;
+  created_at: string;
+}
+
+export interface ApprovalRequest {
+  id: string;
+  run_id: string;
+  room_id: string;
+  step_id: string | null;
+  source_message_id: string | null;
+  agent_name: string;
+  requested_permission_mode: string;
+  status: "pending" | "approved" | "denied";
+  reason: string;
+  resume_kind: string | null;
+  resume_payload: string | null;
+  error_text: string | null;
+  created_at: string;
+  resolved_at: string | null;
+}
+
 // WebSocket message types
 export interface WSChatMessage {
   type: "chat";
   id: string;
   room_id: string;
-  sender_type: string;
+  sender_type: MessageSenderType;
   sender_name: string;
   content: string;
   created_at: string;
@@ -55,7 +134,7 @@ export interface WSStreamChunkMessage {
   type: "stream_chunk";
   id: string;
   room_id: string;
-  sender_type: string;
+  sender_type: MessageSenderType;
   sender_name: string;
   content: string;
   created_at: string;
@@ -67,6 +146,26 @@ export interface WSStatusMessage {
   status: "idle" | "working" | "offline";
 }
 
+export interface WSRunUpdateMessage extends CollaborationRun {
+  type: "run_update";
+}
+
+export interface WSArtifactMessage extends AgentArtifact {
+  type: "artifact";
+}
+
+export interface WSRunStepMessage extends RunStep {
+  type: "run_step";
+}
+
+export interface WSAgentEventMessage extends AgentEvent {
+  type: "agent_event";
+}
+
+export interface WSApprovalRequestMessage extends ApprovalRequest {
+  type: "approval_request";
+}
+
 export interface WSErrorMessage {
   type: "error";
   content: string;
@@ -76,6 +175,11 @@ export type WSIncomingMessage =
   | WSChatMessage
   | WSStreamChunkMessage
   | WSStatusMessage
+  | WSRunUpdateMessage
+  | WSArtifactMessage
+  | WSRunStepMessage
+  | WSAgentEventMessage
+  | WSApprovalRequestMessage
   | WSErrorMessage;
 
 export interface WSOutgoingMessage {

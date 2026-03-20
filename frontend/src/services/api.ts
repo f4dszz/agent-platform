@@ -1,6 +1,15 @@
 // ── REST API client ──────────────────────────────────────────────────────────
 
-import type { Room, Message, Agent } from "../types";
+import type {
+  Agent,
+  AgentArtifact,
+  AgentEvent,
+  ApprovalRequest,
+  CollaborationRun,
+  Room,
+  RunStep,
+  Message,
+} from "../types";
 
 const API_BASE = "/api";
 
@@ -62,13 +71,64 @@ export async function listAgents(): Promise<Agent[]> {
   return request("/agents/");
 }
 
+export async function listRoomRuns(
+  roomId: string,
+  limit = 20,
+  offset = 0
+): Promise<{ runs: CollaborationRun[]; total: number }> {
+  return request(`/collaboration/rooms/${roomId}/runs?limit=${limit}&offset=${offset}`);
+}
+
+export async function listRoomArtifacts(
+  roomId: string,
+  limit = 200,
+  offset = 0
+): Promise<{ artifacts: AgentArtifact[]; total: number }> {
+  return request(`/collaboration/rooms/${roomId}/artifacts?limit=${limit}&offset=${offset}`);
+}
+
+export async function listRoomSteps(
+  roomId: string,
+  limit = 200,
+  offset = 0
+): Promise<{ steps: RunStep[]; total: number }> {
+  return request(`/collaboration/rooms/${roomId}/steps?limit=${limit}&offset=${offset}`);
+}
+
+export async function listRoomEvents(
+  roomId: string,
+  limit = 300,
+  offset = 0
+): Promise<{ events: AgentEvent[]; total: number }> {
+  return request(`/collaboration/rooms/${roomId}/events?limit=${limit}&offset=${offset}`);
+}
+
+export async function listRoomApprovals(
+  roomId: string,
+  limit = 100,
+  offset = 0
+): Promise<{ approvals: ApprovalRequest[]; total: number }> {
+  return request(`/collaboration/rooms/${roomId}/approvals?limit=${limit}&offset=${offset}`);
+}
+
+export async function approveApproval(approvalId: string): Promise<ApprovalRequest> {
+  return request(`/collaboration/approvals/${approvalId}/approve`, { method: "POST" });
+}
+
+export async function denyApproval(approvalId: string): Promise<ApprovalRequest> {
+  return request(`/collaboration/approvals/${approvalId}/deny`, { method: "POST" });
+}
+
 export async function registerAgent(agent: {
   name: string;
   display_name: string;
   agent_type: "claude" | "codex";
   command: string;
+  model?: string | null;
   default_args?: string;
   max_timeout?: number;
+  avatar_label?: string | null;
+  avatar_color?: string | null;
 }): Promise<Agent> {
   return request("/agents/", {
     method: "POST",
@@ -84,8 +144,13 @@ export async function updateAgent(
   agentName: string,
   fields: {
     display_name?: string;
+    command?: string;
+    model?: string | null;
+    default_args?: string | null;
     permission_mode?: string;
     allowed_tools?: string | null;
+    avatar_label?: string | null;
+    avatar_color?: string | null;
     system_prompt?: string | null;
     max_timeout?: number;
   }

@@ -1,28 +1,25 @@
-"""Message orchestrator — routes messages to the appropriate agents.
-
-Rules:
-  - @claude → send to Claude only
-  - @codex  → send to Codex only
-  - @all    → send to all enabled agents in parallel
-  - No mention → broadcast to room, no agent auto-reply (human chat)
-"""
+"""Message orchestrator for native agent collaboration runs."""
 
 import asyncio
+from dataclasses import dataclass
 import logging
 import re
 import subprocess
 import uuid
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Awaitable, Callable
+from typing import Any, Awaitable, Callable
 
 from sqlalchemy import select
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.models.agent import AgentConfig
 from app.models.agent_artifact import AgentArtifact
+from app.models.agent_event import AgentEvent
+from app.models.approval_request import ApprovalRequest
 from app.models.collaboration_run import CollaborationRun
 from app.models.message import Message
+from app.models.run_step import RunStep
 from app.services.agent_memory_store import (
     build_agent_memory_context,
     get_or_create_agent_memory,
@@ -41,7 +38,24 @@ from app.services.collaboration_policy import (
     should_stop_for_limits,
     stop_run,
 )
+from app.services.collaboration_runtime import (
+    APPROVAL_STATUS_APPROVED,
+    APPROVAL_STATUS_DENIED,
+    PermissionEscalationRequired,
+    create_agent_event,
+    create_approval_request,
+    create_run_step,
+    get_run_permission_override,
+    is_permission_error,
+    loads_payload,
+    next_permission_mode,
+    permission_rank,
+    pick_higher_permission,
+    resolve_approval,
+    update_run_step,
+)
 from app.services.codex_agent import CodexAgent
+from app.services.run_intent import CollaborationIntent, build_collaboration_intent
 from app.services.session_manager import session_manager
 
 logger = logging.getLogger(__name__)
@@ -53,6 +67,8 @@ REVIEW_DIRECTIVE_PATTERN = re.compile(r"#review-by=([a-zA-Z0-9_, -]+)")
 HANDOFF_DIRECTIVE_PATTERN = re.compile(r"#handoff=([a-zA-Z0-9_, -]+)")
 REPO_ROOT = Path(__file__).resolve().parents[3]
 MAX_AGENT_CHAIN_DEPTH = 4
+REVIEW_REVISE_STATUSES = {"revise", "changes_requested"}
+REVIEW_BLOCKED_STATUSES = {"blocked"}
 PLATFORM_AGENT_SYSTEM_PROMPT = """
 You are one AI agent participating in a shared multi-agent room.
 
@@ -77,11 +93,32 @@ Rules for collaboration:
 
 StatusCallback = Callable[[str, str], Awaitable[None]]
 StreamCallback = Callable[[Message, str], Awaitable[None]]
+RunCallback = Callable[[CollaborationRun], Awaitable[None]]
+ArtifactCallback = Callable[[AgentArtifact], Awaitable[None]]
+StepCallback = Callable[[RunStep], Awaitable[None]]
+EventCallback = Callable[[AgentEvent], Awaitable[None]]
+ApprovalCallback = Callable[[ApprovalRequest], Awaitable[None]]
 
 AGENT_CLASSES = {
     "claude": ClaudeAgent,
     "codex": CodexAgent,
 }
+
+
+@dataclass(slots=True)
+class AgentStepResult:
+    message: Message | None
+    raw_content: str | None
+    extracted: ExtractedArtifact | None
+    step: RunStep
+    paused: bool = False
+    approval: ApprovalRequest | None = None
+
+
+@dataclass(slots=True)
+class CycleResult:
+    responses: list[Message]
+    paused: bool = False
 
 
 async def _get_collaboration_run(
@@ -99,19 +136,18 @@ async def _get_collaboration_run(
 async def _get_or_create_collaboration_run(
     db: AsyncSession,
     message: Message,
-    review_targets: list[str],
+    intent: CollaborationIntent,
     run_id: str | None = None,
 ) -> CollaborationRun:
     existing = await _get_collaboration_run(db, run_id)
     if existing:
         return existing
 
-    mode = "plan_review" if review_targets else "custom"
     run = CollaborationRun(
         room_id=message.room_id,
         root_message_id=message.id,
         initiator_type=message.sender_type,
-        mode=mode,
+        mode=intent.mode,
         status=RUN_STATUS_RUNNING,
     )
     db.add(run)
@@ -158,6 +194,7 @@ async def _create_agent_artifact(
     message: Message,
     agent_name: str,
     extracted: ExtractedArtifact,
+    on_artifact: ArtifactCallback | None = None,
 ) -> AgentArtifact | None:
     if not extracted.artifact_type or not extracted.clean_content:
         return None
@@ -174,20 +211,41 @@ async def _create_agent_artifact(
     )
     db.add(artifact)
     await db.flush()
+    if on_artifact:
+        await on_artifact(artifact)
     return artifact
 
 
-async def _list_run_artifacts(
-    db: AsyncSession,
-    run_id: str,
-    artifact_type: str | None = None,
-) -> list[AgentArtifact]:
-    stmt = select(AgentArtifact).where(AgentArtifact.run_id == run_id)
-    if artifact_type:
-        stmt = stmt.where(AgentArtifact.artifact_type == artifact_type)
-    stmt = stmt.order_by(AgentArtifact.created_at.asc())
-    result = await db.execute(stmt)
-    return list(result.scalars().all())
+async def _emit_run_update(
+    run: CollaborationRun | None,
+    on_run_update: RunCallback | None,
+) -> None:
+    if run and on_run_update:
+        await on_run_update(run)
+
+
+async def _emit_step_update(
+    step: RunStep | None,
+    on_step: StepCallback | None,
+) -> None:
+    if step and on_step:
+        await on_step(step)
+
+
+async def _emit_event(
+    event: AgentEvent | None,
+    on_event: EventCallback | None,
+) -> None:
+    if event and on_event:
+        await on_event(event)
+
+
+async def _emit_approval(
+    approval: ApprovalRequest | None,
+    on_approval: ApprovalCallback | None,
+) -> None:
+    if approval and on_approval:
+        await on_approval(approval)
 
 
 def _resolve_sender_agent_names(
@@ -374,7 +432,6 @@ async def _build_prompt_with_history(
     include_current_message_in_history: bool = False,
     max_messages: int = 20,
 ) -> str:
-    """Prepend recent chat history so the agent can see prior conversation."""
     stmt = (
         select(Message)
         .where(Message.room_id == room_id)
@@ -385,7 +442,7 @@ async def _build_prompt_with_history(
         stmt = stmt.where(Message.id != current_message_id)
     result = await db.execute(stmt)
     history = list(result.scalars().all())
-    history.reverse()  # chronological order
+    history.reverse()
 
     if not history:
         memory_context = await build_agent_memory_context(
@@ -414,9 +471,7 @@ async def _build_prompt_with_history(
     )
 
     lines = [
-        "Below is the conversation history from a shared chat room. "
-        "Multiple users and AI agents participate. "
-        "Read the history for context, then respond ONLY to the current request at the end.",
+        "Below is the conversation history from a shared chat room. Multiple users and AI agents participate. Read the history for context, then respond ONLY to the current request at the end.",
         "",
     ]
     if memory_context:
@@ -428,11 +483,7 @@ async def _build_prompt_with_history(
                 "",
             ]
         )
-    lines.extend(
-        [
-        "--- CONVERSATION HISTORY ---",
-        ]
-    )
+    lines.append("--- CONVERSATION HISTORY ---")
     for msg in history:
         lines.append(f"[{msg.sender_name}]: {msg.content}")
     lines.append("--- END HISTORY ---")
@@ -450,8 +501,8 @@ async def _call_agent(
     db: AsyncSession | None = None,
     room_id: str | None = None,
     manage_room_memory: bool = True,
+    override_permission_mode: str | None = None,
 ) -> tuple[AgentConfig, str]:
-    """Call a single agent and return (config, response_text)."""
     agent_class = AGENT_CLASSES.get(agent_config.agent_type)
     if not agent_class:
         return agent_config, f"No wrapper for agent type: {agent_config.agent_type}"
@@ -465,9 +516,11 @@ async def _call_agent(
     agent = agent_class(
         command=agent_config.command,
         timeout=agent_config.max_timeout,
-        permission_mode=agent_config.permission_mode,
+        model=agent_config.model,
+        permission_mode=override_permission_mode or agent_config.permission_mode,
         allowed_tools=agent_config.allowed_tools,
         system_prompt=effective_system_prompt,
+        default_args=agent_config.default_args,
     )
 
     if room_id and db and manage_room_memory:
@@ -520,7 +573,21 @@ async def _call_agent(
             await _sync_runtime_to_memory(db, room_id, agent_config.name)
 
     except (TimeoutError, RuntimeError) as e:
-        logger.error(f"Agent {agent_config.name} failed: {e}")
+        error_text = str(e)
+        if is_permission_error(error_text):
+            raise PermissionEscalationRequired(
+                agent_name=agent_config.name,
+                requested_permission_mode=next_permission_mode(
+                    override_permission_mode or agent_config.permission_mode,
+                    error_text,
+                ),
+                reason=(
+                    f"{agent_config.display_name} needs more permission to continue "
+                    f"this step."
+                ),
+                error_text=error_text,
+            )
+        logger.error("Agent %s failed: %s", agent_config.name, e)
         response_text = f"Agent error: {e}"
     finally:
         if room_id:
@@ -541,6 +608,7 @@ async def _run_agent_call(
     on_stream: StreamCallback | None = None,
     *,
     manage_room_memory: bool = True,
+    override_permission_mode: str | None = None,
 ) -> tuple[AgentConfig, str]:
     if on_status:
         await on_status(agent_config.name, "working")
@@ -558,6 +626,7 @@ async def _run_agent_call(
                 db=db,
                 room_id=room_id,
                 manage_room_memory=manage_room_memory,
+                override_permission_mode=override_permission_mode,
             )
         return await _call_agent(
             agent_config,
@@ -565,6 +634,7 @@ async def _run_agent_call(
             db=db,
             room_id=room_id,
             manage_room_memory=manage_room_memory,
+            override_permission_mode=override_permission_mode,
         )
     finally:
         if on_status:
@@ -682,6 +752,33 @@ async def _build_decision_prompt(
     )
 
 
+async def _build_revision_prompt(
+    original_request: str,
+    primary_agent: AgentConfig,
+    previous_output: str,
+    review_texts: list[str],
+) -> str:
+    review_block = "\n\n".join(
+        f"Review {index + 1}:\n{text}" for index, text in enumerate(review_texts)
+    )
+    return "\n".join(
+        [
+            f"You are {primary_agent.display_name}. Revise your previous output using the review feedback.",
+            "Keep the strongest parts of the current solution and change only what the review requires.",
+            "Return the revised output using this protocol:",
+            "#artifact=plan",
+            "",
+            f"Original user request:\n{original_request}",
+            "",
+            f"Previous output:\n{previous_output}",
+            "",
+            f"Review feedback:\n{review_block}",
+            "",
+            "Return a revised, reusable result that directly addresses the review comments.",
+        ]
+    )
+
+
 async def _persist_agent_response(
     db: AsyncSession,
     room_id: str,
@@ -703,29 +800,667 @@ async def _persist_agent_response(
     return agent_message
 
 
+async def _resolve_effective_permission_mode(
+    db: AsyncSession,
+    run: CollaborationRun,
+    agent_config: AgentConfig,
+) -> str:
+    override_mode = await get_run_permission_override(db, run.id, agent_config.name)
+    return pick_higher_permission(agent_config.permission_mode, override_mode)
+
+
+async def _pause_for_approval(
+    db: AsyncSession,
+    run: CollaborationRun,
+    step: RunStep,
+    *,
+    source_message: Message,
+    agent_config: AgentConfig,
+    requested_permission_mode: str,
+    reason: str,
+    resume_kind: str,
+    resume_payload: dict[str, Any],
+    error_text: str | None,
+    on_run_update: RunCallback | None,
+    on_step: StepCallback | None,
+    on_event: EventCallback | None,
+    on_approval: ApprovalCallback | None,
+) -> ApprovalRequest:
+    await update_run_step(
+        db,
+        step,
+        status="pending_approval",
+        content=reason,
+        metadata={
+            "requested_permission_mode": requested_permission_mode,
+            "error_text": error_text,
+        },
+    )
+    approval = await create_approval_request(
+        db,
+        run,
+        agent_name=agent_config.name,
+        requested_permission_mode=requested_permission_mode,
+        reason=reason,
+        step=step,
+        source_message=source_message,
+        resume_kind=resume_kind,
+        resume_payload=resume_payload,
+        error_text=error_text,
+    )
+    event = await create_agent_event(
+        db,
+        run,
+        event_type="approval_requested",
+        agent_name=agent_config.name,
+        step=step,
+        source_message=source_message,
+        content=reason,
+        payload={
+            "requested_permission_mode": requested_permission_mode,
+            "approval_id": approval.id,
+        },
+    )
+    stop_run(run, RUN_STATUS_BLOCKED, "approval_required")
+    await db.flush()
+    await _emit_step_update(step, on_step)
+    await _emit_approval(approval, on_approval)
+    await _emit_event(event, on_event)
+    await _emit_run_update(run, on_run_update)
+    return approval
+
+
+async def _execute_agent_step(
+    db: AsyncSession,
+    run: CollaborationRun,
+    *,
+    source_message: Message,
+    agent_config: AgentConfig,
+    prompt: str,
+    step_type: str,
+    step_title: str,
+    on_response=None,
+    on_status: StatusCallback | None = None,
+    on_stream: StreamCallback | None = None,
+    on_run_update: RunCallback | None = None,
+    on_artifact: ArtifactCallback | None = None,
+    on_step: StepCallback | None = None,
+    on_event: EventCallback | None = None,
+    on_approval: ApprovalCallback | None = None,
+    default_artifact_type: str | None = None,
+    default_status: str | None = None,
+    count_as_review: bool = False,
+    required_permission_mode: str | None = None,
+    allow_approval: bool = False,
+    emit_run_update: bool = True,
+    resume_kind: str | None = None,
+    resume_payload: dict[str, Any] | None = None,
+) -> AgentStepResult:
+    step = await create_run_step(
+        db,
+        run,
+        step_type=step_type,
+        status="working",
+        agent_name=agent_config.name,
+        source_message=source_message,
+        title=step_title,
+        content=None,
+        metadata={"phase": step_type},
+    )
+    started_event = await create_agent_event(
+        db,
+        run,
+        event_type="step_started",
+        agent_name=agent_config.name,
+        step=step,
+        source_message=source_message,
+        content=step_title,
+        payload={"step_type": step_type},
+    )
+    await _emit_step_update(step, on_step)
+    await _emit_event(started_event, on_event)
+
+    effective_permission_mode = await _resolve_effective_permission_mode(
+        db,
+        run,
+        agent_config,
+    )
+    if (
+        allow_approval
+        and required_permission_mode
+        and permission_rank(required_permission_mode) > permission_rank(effective_permission_mode)
+    ):
+        approval = await _pause_for_approval(
+            db,
+            run,
+            step,
+            source_message=source_message,
+            agent_config=agent_config,
+            requested_permission_mode=required_permission_mode,
+            reason=(
+                f"{agent_config.display_name} needs {required_permission_mode} "
+                "permission before continuing this step."
+            ),
+            resume_kind=resume_kind or "target_cycle",
+            resume_payload=resume_payload or {},
+            error_text=None,
+            on_run_update=on_run_update,
+            on_step=on_step,
+            on_event=on_event,
+            on_approval=on_approval,
+        )
+        return AgentStepResult(
+            message=None,
+            raw_content=None,
+            extracted=None,
+            step=step,
+            paused=True,
+            approval=approval,
+        )
+
+    transient_message = _build_transient_agent_message(run.room_id, agent_config)
+    try:
+        _, response_text = await _run_agent_call(
+            db,
+            run.room_id,
+            agent_config,
+            prompt,
+            on_status,
+            stream_message=transient_message,
+            on_stream=on_stream,
+            manage_room_memory=False,
+            override_permission_mode=effective_permission_mode,
+        )
+    except PermissionEscalationRequired as exc:
+        if allow_approval:
+            approval = await _pause_for_approval(
+                db,
+                run,
+                step,
+                source_message=source_message,
+                agent_config=agent_config,
+                requested_permission_mode=exc.requested_permission_mode,
+                reason=exc.reason,
+                resume_kind=resume_kind or "target_cycle",
+                resume_payload=resume_payload or {},
+                error_text=exc.error_text,
+                on_run_update=on_run_update,
+                on_step=on_step,
+                on_event=on_event,
+                on_approval=on_approval,
+            )
+            return AgentStepResult(
+                message=None,
+                raw_content=None,
+                extracted=None,
+                step=step,
+                paused=True,
+                approval=approval,
+            )
+        logger.error("Permission escalation required but approval disabled: %s", exc)
+        response_text = f"Agent error: {exc.error_text}"
+
+    extracted = extract_artifact(
+        response_text,
+        default_artifact_type=default_artifact_type,
+        default_status=default_status,
+    )
+    agent_message = await _persist_agent_response(
+        db,
+        run.room_id,
+        transient_message,
+        agent_config,
+        response_text,
+        extracted,
+    )
+    register_step(run)
+    if count_as_review:
+        register_review_round(run)
+    await _sync_runtime_to_memory(db, run.room_id, agent_config.name)
+    artifact = await _create_agent_artifact(
+        db,
+        run,
+        agent_message,
+        agent_config.name,
+        extracted,
+        on_artifact=on_artifact,
+    )
+    step.source_message_id = agent_message.id
+    await update_run_step(
+        db,
+        step,
+        status="completed",
+        title=extracted.title or step_title,
+        content=extracted.clean_content,
+        metadata={
+            "artifact_type": extracted.artifact_type,
+            "artifact_status": extracted.status,
+            "artifact_id": artifact.id if artifact else None,
+        },
+    )
+    completed_event = await create_agent_event(
+        db,
+        run,
+        event_type="step_completed",
+        agent_name=agent_config.name,
+        step=step,
+        source_message=agent_message,
+        content=extracted.title or extracted.clean_content[:160],
+        payload={
+            "step_type": step_type,
+            "artifact_type": extracted.artifact_type,
+            "status": extracted.status,
+        },
+    )
+    await db.flush()
+    if emit_run_update:
+        await _emit_run_update(run, on_run_update)
+    await _emit_step_update(step, on_step)
+    await _emit_event(completed_event, on_event)
+    if on_response:
+        await on_response(agent_message)
+    return AgentStepResult(
+        message=agent_message,
+        raw_content=response_text,
+        extracted=extracted,
+        step=step,
+    )
+
+
+async def _run_parallel_targets(
+    message: Message,
+    db: AsyncSession,
+    *,
+    run: CollaborationRun,
+    targets: list[AgentConfig],
+    prompt_by_agent: dict[str, str],
+    on_response=None,
+    on_status: StatusCallback | None = None,
+    on_stream: StreamCallback | None = None,
+    on_run_update: RunCallback | None = None,
+    on_artifact: ArtifactCallback | None = None,
+    on_step: StepCallback | None = None,
+    on_event: EventCallback | None = None,
+    on_approval: ApprovalCallback | None = None,
+    chain_depth: int,
+    agent_chain: tuple[str, ...],
+) -> list[Message]:
+    responses: list[Message] = []
+
+    async def run_target(
+        cfg: AgentConfig,
+        transient_message: Message,
+    ) -> tuple[Message, AgentConfig, str]:
+        try:
+            agent_config, response_text = await _run_agent_call(
+                db,
+                message.room_id,
+                cfg,
+                prompt_by_agent[cfg.name.lower()],
+                on_status,
+                stream_message=transient_message,
+                on_stream=on_stream,
+                manage_room_memory=False,
+            )
+        except Exception as e:
+            logger.error("Agent call failed for %s: %s", cfg.name, e)
+            agent_config = cfg
+            response_text = f"Agent error: {e}"
+        return transient_message, agent_config, response_text
+
+    tasks = [
+        asyncio.create_task(
+            run_target(cfg, _build_transient_agent_message(message.room_id, cfg))
+        )
+        for cfg in targets
+    ]
+
+    for task in asyncio.as_completed(tasks):
+        transient_message, agent_config, response_text = await task
+        extracted = extract_artifact(response_text)
+        agent_message = await _persist_agent_response(
+            db,
+            message.room_id,
+            transient_message,
+            agent_config,
+            response_text,
+            extracted,
+        )
+        register_step(run)
+        await _sync_runtime_to_memory(db, message.room_id, agent_config.name)
+        artifact = await _create_agent_artifact(
+            db,
+            run,
+            agent_message,
+            agent_config.name,
+            extracted,
+            on_artifact=on_artifact,
+        )
+        step = await create_run_step(
+            db,
+            run,
+            step_type="agent_response",
+            status="completed",
+            agent_name=agent_config.name,
+            source_message=agent_message,
+            title=extracted.title or f"{agent_config.display_name} responded",
+            content=extracted.clean_content,
+            metadata={
+                "artifact_type": extracted.artifact_type,
+                "artifact_status": extracted.status,
+                "artifact_id": artifact.id if artifact else None,
+            },
+        )
+        event = await create_agent_event(
+            db,
+            run,
+            event_type="step_completed",
+            agent_name=agent_config.name,
+            step=step,
+            source_message=agent_message,
+            content=step.title,
+            payload={"step_type": "agent_response"},
+        )
+        await _emit_run_update(run, on_run_update)
+        await _emit_step_update(step, on_step)
+        await _emit_event(event, on_event)
+        responses.append(agent_message)
+        if on_response:
+            await on_response(agent_message)
+
+        if run.status == RUN_STATUS_RUNNING:
+            chained_responses = await route_message(
+                agent_message,
+                db,
+                on_response=on_response,
+                on_status=on_status,
+                on_stream=on_stream,
+                on_run_update=on_run_update,
+                on_artifact=on_artifact,
+                on_step=on_step,
+                on_event=on_event,
+                on_approval=on_approval,
+                chain_depth=chain_depth + 1,
+                agent_chain=(*agent_chain, agent_config.name.lower()),
+                run_id=run.id,
+                raw_content_override=response_text,
+            )
+            responses.extend(chained_responses)
+
+    return responses
+
+
+async def _run_target_cycle(
+    message: Message,
+    db: AsyncSession,
+    *,
+    run: CollaborationRun,
+    agent_config: AgentConfig,
+    reviewer_configs: list[AgentConfig],
+    intent: CollaborationIntent,
+    clean_content: str,
+    primary_prompt: str,
+    on_response=None,
+    on_status: StatusCallback | None = None,
+    on_stream: StreamCallback | None = None,
+    on_run_update: RunCallback | None = None,
+    on_artifact: ArtifactCallback | None = None,
+    on_step: StepCallback | None = None,
+    on_event: EventCallback | None = None,
+    on_approval: ApprovalCallback | None = None,
+    chain_depth: int = 0,
+    agent_chain: tuple[str, ...] = (),
+    primary_phase: str = "plan",
+) -> CycleResult:
+    responses: list[Message] = []
+    primary_step_type = "revision" if primary_phase == "revision" else "plan"
+    primary_title = (
+        f"{agent_config.display_name} revising after review"
+        if primary_phase == "revision"
+        else f"{agent_config.display_name} drafting the current solution"
+    )
+    primary_result = await _execute_agent_step(
+        db,
+        run,
+        source_message=message,
+        agent_config=agent_config,
+        prompt=primary_prompt,
+        step_type=primary_step_type,
+        step_title=primary_title,
+        on_response=on_response,
+        on_status=on_status,
+        on_stream=on_stream,
+        on_run_update=on_run_update,
+        on_artifact=on_artifact,
+        on_step=on_step,
+        on_event=on_event,
+        on_approval=on_approval,
+        default_artifact_type="plan" if reviewer_configs else None,
+        required_permission_mode=intent.required_permission_mode,
+        allow_approval=True,
+        resume_kind="target_cycle",
+        resume_payload={
+            "source_message_id": message.id,
+            "clean_content": clean_content,
+            "agent_name": agent_config.name,
+            "reviewer_names": [reviewer.name for reviewer in reviewer_configs],
+            "mode": intent.mode,
+            "wants_revision_loop": intent.wants_revision_loop,
+            "require_decision": intent.require_decision,
+            "required_permission_mode": intent.required_permission_mode,
+            "prompt": primary_prompt,
+            "chain_depth": chain_depth,
+            "agent_chain": list(agent_chain),
+            "primary_phase": primary_phase,
+        },
+    )
+    if primary_result.paused or not primary_result.message or not primary_result.extracted:
+        return CycleResult(responses=responses, paused=True)
+    responses.append(primary_result.message)
+    current_primary = primary_result
+
+    follow_up_message = current_primary.message
+    follow_up_raw_content = current_primary.raw_content or current_primary.message.content
+
+    if reviewer_configs:
+        while run.status == RUN_STATUS_RUNNING:
+            limit_reason = should_stop_for_limits(run)
+            if limit_reason:
+                stop_run(run, RUN_STATUS_STOPPED, limit_reason)
+                await _emit_run_update(run, on_run_update)
+                break
+
+            review_texts: list[str] = []
+            review_statuses: set[str] = set()
+            for reviewer_config in reviewer_configs:
+                review_prompt = await _build_review_prompt(
+                    clean_content,
+                    agent_config,
+                    current_primary.extracted.clean_content,
+                )
+                review_result = await _execute_agent_step(
+                    db,
+                    run,
+                    source_message=current_primary.message,
+                    agent_config=reviewer_config,
+                    prompt=review_prompt,
+                    step_type="review",
+                    step_title=f"{reviewer_config.display_name} reviewing the latest output",
+                    on_response=on_response,
+                    on_status=on_status,
+                    on_stream=on_stream,
+                    on_run_update=on_run_update,
+                    on_artifact=on_artifact,
+                    on_step=on_step,
+                    on_event=on_event,
+                    on_approval=on_approval,
+                    default_artifact_type="review",
+                    count_as_review=True,
+                    allow_approval=False,
+                )
+                if review_result.paused or not review_result.message or not review_result.extracted:
+                    return CycleResult(responses=responses, paused=True)
+                responses.append(review_result.message)
+                review_texts.append(review_result.extracted.clean_content)
+                if review_result.extracted.status:
+                    review_statuses.add(review_result.extracted.status)
+
+            if review_statuses & REVIEW_BLOCKED_STATUSES:
+                stop_run(run, RUN_STATUS_BLOCKED, "review_blocked")
+                await _emit_run_update(run, on_run_update)
+                break
+
+            if intent.wants_revision_loop and review_statuses & REVIEW_REVISE_STATUSES:
+                limit_reason = should_stop_for_limits(run)
+                if limit_reason:
+                    stop_run(run, RUN_STATUS_STOPPED, limit_reason)
+                    await _emit_run_update(run, on_run_update)
+                    break
+
+                revision_prompt = await _build_revision_prompt(
+                    clean_content,
+                    agent_config,
+                    current_primary.extracted.clean_content,
+                    review_texts,
+                )
+                revision_result = await _execute_agent_step(
+                    db,
+                    run,
+                    source_message=follow_up_message,
+                    agent_config=agent_config,
+                    prompt=revision_prompt,
+                    step_type="revision",
+                    step_title=f"{agent_config.display_name} revising after review",
+                    on_response=on_response,
+                    on_status=on_status,
+                    on_stream=on_stream,
+                    on_run_update=on_run_update,
+                    on_artifact=on_artifact,
+                    on_step=on_step,
+                    on_event=on_event,
+                    on_approval=on_approval,
+                    default_artifact_type="plan",
+                    required_permission_mode=intent.required_permission_mode,
+                    allow_approval=True,
+                    resume_kind="target_cycle",
+                    resume_payload={
+                        "source_message_id": follow_up_message.id,
+                        "clean_content": clean_content,
+                        "agent_name": agent_config.name,
+                        "reviewer_names": [reviewer.name for reviewer in reviewer_configs],
+                        "mode": intent.mode,
+                        "wants_revision_loop": intent.wants_revision_loop,
+                        "require_decision": intent.require_decision,
+                        "required_permission_mode": intent.required_permission_mode,
+                        "prompt": revision_prompt,
+                        "chain_depth": chain_depth,
+                        "agent_chain": list(agent_chain),
+                        "primary_phase": "revision",
+                    },
+                )
+                if (
+                    revision_result.paused
+                    or not revision_result.message
+                    or not revision_result.extracted
+                ):
+                    return CycleResult(responses=responses, paused=True)
+                responses.append(revision_result.message)
+                current_primary = revision_result
+                follow_up_message = revision_result.message
+                follow_up_raw_content = (
+                    revision_result.raw_content or revision_result.message.content
+                )
+                continue
+
+            if intent.require_decision and run.status == RUN_STATUS_RUNNING:
+                decision_prompt = await _build_decision_prompt(
+                    clean_content,
+                    agent_config,
+                    current_primary.extracted.clean_content,
+                    review_texts,
+                )
+                decision_result = await _execute_agent_step(
+                    db,
+                    run,
+                    source_message=current_primary.message,
+                    agent_config=agent_config,
+                    prompt=decision_prompt,
+                    step_type="decision",
+                    step_title=f"{agent_config.display_name} making the final decision",
+                    on_response=on_response,
+                    on_status=on_status,
+                    on_stream=on_stream,
+                    on_run_update=on_run_update,
+                    on_artifact=on_artifact,
+                    on_step=on_step,
+                    on_event=on_event,
+                    on_approval=on_approval,
+                    default_artifact_type="decision",
+                    allow_approval=False,
+                    emit_run_update=False,
+                )
+                if (
+                    decision_result.paused
+                    or not decision_result.message
+                    or not decision_result.extracted
+                ):
+                    return CycleResult(responses=responses, paused=True)
+                responses.append(decision_result.message)
+                finalize_run_from_artifact(
+                    run,
+                    decision_result.extracted.artifact_type,
+                    decision_result.extracted.status,
+                )
+                await _emit_run_update(run, on_run_update)
+                follow_up_message = decision_result.message
+                follow_up_raw_content = (
+                    decision_result.raw_content or decision_result.message.content
+                )
+            break
+
+    if run.status == RUN_STATUS_RUNNING:
+        chained_agents = (
+            *agent_chain,
+            agent_config.name.lower(),
+            *(reviewer.name.lower() for reviewer in reviewer_configs),
+        )
+        chained_responses = await route_message(
+            follow_up_message,
+            db,
+            on_response=on_response,
+            on_status=on_status,
+            on_stream=on_stream,
+            on_run_update=on_run_update,
+            on_artifact=on_artifact,
+            on_step=on_step,
+            on_event=on_event,
+            on_approval=on_approval,
+            chain_depth=chain_depth + 1,
+            agent_chain=chained_agents,
+            run_id=run.id,
+            raw_content_override=follow_up_raw_content,
+        )
+        responses.extend(chained_responses)
+
+    return CycleResult(responses=responses, paused=False)
+
+
 async def route_message(
     message: Message,
     db: AsyncSession,
     on_response=None,
     on_status: StatusCallback | None = None,
     on_stream: StreamCallback | None = None,
+    on_run_update: RunCallback | None = None,
+    on_artifact: ArtifactCallback | None = None,
+    on_step: StepCallback | None = None,
+    on_event: EventCallback | None = None,
+    on_approval: ApprovalCallback | None = None,
     chain_depth: int = 0,
     agent_chain: tuple[str, ...] = (),
     run_id: str | None = None,
     raw_content_override: str | None = None,
 ) -> list[Message]:
-    """Route an incoming message to the appropriate agents.
-
-    Args:
-        message: The incoming message (already saved to DB).
-        db: Database session.
-        on_response: Optional async callback(Message) called as each agent responds
-                     (for real-time broadcast before all agents finish).
-        on_status: Optional async callback(agent_name, status) for status updates.
-        on_stream: Optional async callback(Message, content) for progressive chunks.
-        chain_depth: Current recursive depth for agent-to-agent chaining.
-        agent_chain: Ordered names of agents already invoked in this route chain.
-    """
     raw_content = raw_content_override or message.content
 
     run = await _get_collaboration_run(db, run_id)
@@ -734,6 +1469,7 @@ async def route_message(
         if run and run.status == RUN_STATUS_RUNNING:
             stop_run(run, RUN_STATUS_STOPPED, "max_agent_chain_depth_exceeded")
             await db.flush()
+            await _emit_run_update(run, on_run_update)
         return []
 
     if message.sender_type == "human":
@@ -742,7 +1478,6 @@ async def route_message(
     else:
         mentions = extract_agent_handoff_targets(raw_content)
         clean_content = extract_agent_handoff_request(raw_content)
-    review_targets = extract_review_targets(raw_content)
 
     if not mentions:
         return []
@@ -774,20 +1509,53 @@ async def route_message(
     if not targets:
         return []
 
+    explicit_review_targets = extract_review_targets(raw_content)
+    if message.sender_type == "human":
+        intent = build_collaboration_intent(
+            raw_content,
+            enabled_agents,
+            targets,
+            explicit_review_targets,
+        )
+    else:
+        intent = CollaborationIntent(
+            mode="plan_review" if explicit_review_targets else "custom",
+            review_targets=explicit_review_targets,
+            wants_revision_loop=False,
+            require_decision=bool(explicit_review_targets),
+            required_permission_mode=None,
+        )
     reviewer_configs: list[AgentConfig] = []
     seen_reviewers: set[str] = set()
     primary_names = {target.name.lower() for target in targets}
-    for reviewer_name in review_targets:
-        if reviewer_name in agent_map and reviewer_name not in primary_names and reviewer_name not in seen_reviewers:
+    for reviewer_name in intent.review_targets:
+        if (
+            reviewer_name in agent_map
+            and reviewer_name not in primary_names
+            and reviewer_name not in seen_reviewers
+        ):
             reviewer_configs.append(agent_map[reviewer_name])
             seen_reviewers.add(reviewer_name)
 
+    existing_run = run
     run = await _get_or_create_collaboration_run(
         db,
         message,
-        review_targets,
+        intent,
         run_id=run_id,
     )
+    if not existing_run:
+        started_event = await create_agent_event(
+            db,
+            run,
+            event_type="run_started",
+            source_message=message,
+            content=f"Run started in {run.mode}",
+            payload={"root_message_id": message.id},
+        )
+        await _emit_run_update(run, on_run_update)
+        await _emit_event(started_event, on_event)
+
     if run.status != RUN_STATUS_RUNNING:
         return []
 
@@ -795,6 +1563,7 @@ async def route_message(
     if limit_reason:
         stop_run(run, RUN_STATUS_STOPPED, limit_reason)
         await db.flush()
+        await _emit_run_update(run, on_run_update)
         return []
 
     prompt_request = clean_content
@@ -805,7 +1574,7 @@ async def route_message(
                 raw_content,
                 enabled_agents,
                 targets,
-                review_targets,
+                intent.review_targets,
             )
         )
         if reviewer_configs and len(targets) == 1:
@@ -818,7 +1587,6 @@ async def route_message(
                 ]
             )
 
-    # Build prompt with chat history so agent can see prior conversation
     prompt_by_agent: dict[str, str] = {}
     for target in targets:
         await _hydrate_runtime_from_memory(db, message.room_id, target.name)
@@ -831,250 +1599,218 @@ async def route_message(
             include_current_message_in_history=message.sender_type != "human",
         )
 
-    responses: list[Message] = []
-
-    async def run_target(
-        cfg: AgentConfig,
-        transient_message: Message,
-    ) -> tuple[Message, AgentConfig, str]:
-        try:
-            agent_config, response_text = await _run_agent_call(
-                db,
-                message.room_id,
-                cfg,
-                prompt_by_agent[cfg.name.lower()],
-                on_status,
-                stream_message=transient_message,
-                on_stream=on_stream,
-                manage_room_memory=False,
-            )
-        except Exception as e:
-            logger.error("Agent call failed for %s: %s", cfg.name, e)
-            agent_config = cfg
-            response_text = f"Agent error: {e}"
-        return transient_message, agent_config, response_text
-
-    tasks = [
-        asyncio.create_task(run_target(cfg, _build_transient_agent_message(message.room_id, cfg)))
-        for cfg in targets
-    ]
-    for task in asyncio.as_completed(tasks):
-        transient_message, agent_config, response_text = await task
-        primary_extracted = extract_artifact(
-            response_text,
-            default_artifact_type="plan" if reviewer_configs else None,
-        )
-        agent_message = await _persist_agent_response(
+    if len(targets) > 1 and not reviewer_configs:
+        responses = await _run_parallel_targets(
+            message,
             db,
-            message.room_id,
-            transient_message,
-            agent_config,
-            response_text,
-            primary_extracted,
+            run=run,
+            targets=targets,
+            prompt_by_agent=prompt_by_agent,
+            on_response=on_response,
+            on_status=on_status,
+            on_stream=on_stream,
+            on_run_update=on_run_update,
+            on_artifact=on_artifact,
+            on_step=on_step,
+            on_event=on_event,
+            on_approval=on_approval,
+            chain_depth=chain_depth,
+            agent_chain=agent_chain,
         )
-        register_step(run)
-        await _sync_runtime_to_memory(db, message.room_id, agent_config.name)
-        await _create_agent_artifact(
+    else:
+        cycle_result = await _run_target_cycle(
+            message,
             db,
-            run,
-            agent_message,
-            agent_config.name,
-            primary_extracted,
+            run=run,
+            agent_config=targets[0],
+            reviewer_configs=reviewer_configs,
+            intent=intent,
+            clean_content=clean_content,
+            primary_prompt=prompt_by_agent[targets[0].name.lower()],
+            on_response=on_response,
+            on_status=on_status,
+            on_stream=on_stream,
+            on_run_update=on_run_update,
+            on_artifact=on_artifact,
+            on_step=on_step,
+            on_event=on_event,
+            on_approval=on_approval,
+            chain_depth=chain_depth,
+            agent_chain=agent_chain,
         )
-        responses.append(agent_message)
-
-        # Stream each response to clients as it arrives
-        if on_response:
-            await on_response(agent_message)
-
-        review_texts: list[str] = []
-        for reviewer_config in reviewer_configs:
-            limit_reason = should_stop_for_limits(run)
-            if limit_reason:
-                stop_run(run, RUN_STATUS_STOPPED, limit_reason)
-                break
-
-            await _hydrate_runtime_from_memory(db, message.room_id, reviewer_config.name)
-            review_prompt = await _build_review_prompt(
-                clean_content,
-                agent_config,
-                primary_extracted.clean_content,
-            )
-            review_transient_message = _build_transient_agent_message(
-                message.room_id,
-                reviewer_config,
-            )
-            try:
-                _, review_text = await _run_agent_call(
-                    db,
-                    message.room_id,
-                    reviewer_config,
-                    review_prompt,
-                    on_status,
-                    stream_message=review_transient_message,
-                    on_stream=on_stream,
-                    manage_room_memory=False,
-                )
-            except Exception as e:
-                logger.error(
-                    "Review agent %s failed after %s response: %s",
-                        reviewer_config.name,
-                        agent_config.name,
-                        e,
-                    )
-                extracted_error = extract_artifact(
-                    f"#artifact=review\n#status=blocked\nAgent error: {e}",
-                    default_artifact_type="review",
-                    default_status="blocked",
-                )
-                review_message = Message(
-                    id=review_transient_message.id,
-                    room_id=review_transient_message.room_id,
-                    sender_type=review_transient_message.sender_type,
-                    sender_name=review_transient_message.sender_name,
-                    content=extracted_error.clean_content,
-                    created_at=review_transient_message.created_at,
-                )
-                db.add(review_message)
-                await db.flush()
-                register_step(run)
-                register_review_round(run)
-                await _create_agent_artifact(
-                    db,
-                    run,
-                    review_message,
-                    reviewer_config.name,
-                    extracted_error,
-                )
-                responses.append(review_message)
-                if on_response:
-                    await on_response(review_message)
-                continue
-
-            extracted_review = extract_artifact(
-                review_text,
-                default_artifact_type="review",
-            )
-            review_message = await _persist_agent_response(
-                db,
-                room_id=message.room_id,
-                transient_message=review_transient_message,
-                agent_config=reviewer_config,
-                raw_content=review_text,
-                extracted=extracted_review,
-            )
-            register_step(run)
-            register_review_round(run)
-            await _sync_runtime_to_memory(db, message.room_id, reviewer_config.name)
-            await _create_agent_artifact(
-                db,
-                run,
-                review_message,
-                reviewer_config.name,
-                extracted_review,
-            )
-            responses.append(review_message)
-            review_texts.append(extracted_review.clean_content)
-
-            if on_response:
-                await on_response(review_message)
-
-        decision_raw_content: str | None = None
-        decision_message: Message | None = None
-        if reviewer_configs and run.status == RUN_STATUS_RUNNING:
-            limit_reason = should_stop_for_limits(run)
-            if limit_reason:
-                stop_run(run, RUN_STATUS_STOPPED, limit_reason)
-            else:
-                await _hydrate_runtime_from_memory(db, message.room_id, agent_config.name)
-                decision_prompt = await _build_decision_prompt(
-                    clean_content,
-                    agent_config,
-                    primary_extracted.clean_content,
-                    review_texts,
-                )
-                decision_transient_message = _build_transient_agent_message(
-                    message.room_id,
-                    agent_config,
-                )
-                try:
-                    _, decision_raw_content = await _run_agent_call(
-                        db,
-                        message.room_id,
-                        agent_config,
-                        decision_prompt,
-                        on_status,
-                        stream_message=decision_transient_message,
-                        on_stream=on_stream,
-                        manage_room_memory=False,
-                    )
-                    extracted_decision = extract_artifact(
-                        decision_raw_content,
-                        default_artifact_type="decision",
-                    )
-                except Exception as e:
-                    logger.error(
-                        "Decision step failed for %s in run %s: %s",
-                        agent_config.name,
-                        run.id,
-                        e,
-                    )
-                    decision_raw_content = f"#artifact=decision\n#status=blocked\nAgent error: {e}"
-                    extracted_decision = extract_artifact(
-                        decision_raw_content,
-                        default_artifact_type="decision",
-                        default_status="blocked",
-                    )
-
-                decision_message = await _persist_agent_response(
-                    db,
-                    message.room_id,
-                    decision_transient_message,
-                    agent_config,
-                    decision_raw_content,
-                    extracted_decision,
-                )
-                register_step(run)
-                await _sync_runtime_to_memory(db, message.room_id, agent_config.name)
-                await _create_agent_artifact(
-                    db,
-                    run,
-                    decision_message,
-                    agent_config.name,
-                    extracted_decision,
-                )
-                finalize_run_from_artifact(
-                    run,
-                    extracted_decision.artifact_type,
-                    extracted_decision.status,
-                )
-                responses.append(decision_message)
-                if on_response:
-                    await on_response(decision_message)
-
-        follow_up_message = decision_message or agent_message
-        follow_up_raw_content = decision_raw_content or response_text
-        chained_agents = (
-            *agent_chain,
-            agent_config.name.lower(),
-            *(reviewer.name.lower() for reviewer in reviewer_configs),
-        )
-        if run.status == RUN_STATUS_RUNNING:
-            chained_responses = await route_message(
-                follow_up_message,
-                db,
-                on_response=on_response,
-                on_status=on_status,
-                on_stream=on_stream,
-                chain_depth=chain_depth + 1,
-                agent_chain=chained_agents,
-                run_id=run.id,
-                raw_content_override=follow_up_raw_content,
-            )
-            responses.extend(chained_responses)
+        responses = cycle_result.responses
+        if cycle_result.paused:
+            await db.flush()
+            return responses
 
     if run.status == RUN_STATUS_RUNNING:
         stop_run(run, RUN_STATUS_COMPLETED, "no_further_actions")
-    await db.flush()
+        completed_event = await create_agent_event(
+            db,
+            run,
+            event_type="run_completed",
+            source_message=message,
+            content="Run completed with no further actions",
+            payload={"stop_reason": run.stop_reason},
+        )
+        await _emit_run_update(run, on_run_update)
+        await _emit_event(completed_event, on_event)
 
+    await db.flush()
     return responses
+
+
+async def resume_approval_request(
+    approval_id: str,
+    db: AsyncSession,
+    *,
+    on_response=None,
+    on_status: StatusCallback | None = None,
+    on_stream: StreamCallback | None = None,
+    on_run_update: RunCallback | None = None,
+    on_artifact: ArtifactCallback | None = None,
+    on_step: StepCallback | None = None,
+    on_event: EventCallback | None = None,
+    on_approval: ApprovalCallback | None = None,
+) -> CollaborationRun:
+    approval_result = await db.execute(
+        select(ApprovalRequest).where(ApprovalRequest.id == approval_id)
+    )
+    approval = approval_result.scalar_one_or_none()
+    if not approval:
+        raise ValueError("Approval request not found")
+    if approval.status != APPROVAL_STATUS_APPROVED:
+        raise ValueError("Approval request is not approved")
+    if approval.resume_kind != "target_cycle":
+        raise ValueError("Unsupported approval continuation")
+
+    payload = loads_payload(approval.resume_payload)
+    source_message_id = payload.get("source_message_id")
+    if not source_message_id:
+        raise ValueError("Approval continuation missing source message")
+
+    run = await _get_collaboration_run(db, approval.run_id)
+    if not run:
+        raise ValueError("Collaboration run not found")
+    run.status = RUN_STATUS_RUNNING
+    run.stop_reason = None
+
+    source_message_result = await db.execute(
+        select(Message).where(Message.id == source_message_id)
+    )
+    source_message = source_message_result.scalar_one_or_none()
+    if not source_message:
+        raise ValueError("Approval continuation source message not found")
+
+    agent_result = await db.execute(
+        select(AgentConfig).where(AgentConfig.name == payload.get("agent_name"))
+    )
+    agent_config = agent_result.scalar_one_or_none()
+    if not agent_config:
+        raise ValueError("Primary agent not found")
+
+    reviewer_configs: list[AgentConfig] = []
+    for reviewer_name in payload.get("reviewer_names", []):
+        reviewer_result = await db.execute(
+            select(AgentConfig).where(AgentConfig.name == reviewer_name)
+        )
+        reviewer = reviewer_result.scalar_one_or_none()
+        if reviewer:
+            reviewer_configs.append(reviewer)
+
+    approval_event = await create_agent_event(
+        db,
+        run,
+        event_type="approval_resolved",
+        agent_name=approval.agent_name,
+        source_message=source_message,
+        content=f"Approval granted for {approval.agent_name}",
+        payload={
+            "approval_id": approval.id,
+            "requested_permission_mode": approval.requested_permission_mode,
+        },
+    )
+    await _emit_event(approval_event, on_event)
+    await _emit_run_update(run, on_run_update)
+    await _emit_approval(approval, on_approval)
+
+    intent = CollaborationIntent(
+        mode=str(payload.get("mode") or run.mode),
+        review_targets=[str(item) for item in payload.get("reviewer_names", [])],
+        wants_revision_loop=bool(payload.get("wants_revision_loop")),
+        require_decision=bool(payload.get("require_decision", True)),
+        required_permission_mode=payload.get("required_permission_mode"),
+    )
+    cycle_result = await _run_target_cycle(
+        source_message,
+        db,
+        run=run,
+        agent_config=agent_config,
+        reviewer_configs=reviewer_configs,
+        intent=intent,
+        clean_content=str(payload.get("clean_content") or source_message.content),
+        primary_prompt=str(payload.get("prompt") or source_message.content),
+        on_response=on_response,
+        on_status=on_status,
+        on_stream=on_stream,
+        on_run_update=on_run_update,
+        on_artifact=on_artifact,
+        on_step=on_step,
+        on_event=on_event,
+        on_approval=on_approval,
+        chain_depth=int(payload.get("chain_depth") or 0),
+        agent_chain=tuple(payload.get("agent_chain") or []),
+        primary_phase=str(payload.get("primary_phase") or "plan"),
+    )
+    if not cycle_result.paused and run.status == RUN_STATUS_RUNNING:
+        stop_run(run, RUN_STATUS_COMPLETED, "no_further_actions")
+        completed_event = await create_agent_event(
+            db,
+            run,
+            event_type="run_completed",
+            source_message=source_message,
+            content="Run completed with no further actions",
+            payload={"stop_reason": run.stop_reason},
+        )
+        await _emit_run_update(run, on_run_update)
+        await _emit_event(completed_event, on_event)
+
+    await db.flush()
+    return run
+
+
+async def deny_approval_request(
+    approval_id: str,
+    db: AsyncSession,
+    *,
+    on_run_update: RunCallback | None = None,
+    on_event: EventCallback | None = None,
+    on_approval: ApprovalCallback | None = None,
+) -> ApprovalRequest:
+    approval_result = await db.execute(
+        select(ApprovalRequest).where(ApprovalRequest.id == approval_id)
+    )
+    approval = approval_result.scalar_one_or_none()
+    if not approval:
+        raise ValueError("Approval request not found")
+
+    resolve_approval(approval, APPROVAL_STATUS_DENIED)
+    run = await _get_collaboration_run(db, approval.run_id)
+    if run:
+        stop_run(run, RUN_STATUS_BLOCKED, "approval_denied")
+        denied_event = await create_agent_event(
+            db,
+            run,
+            event_type="approval_resolved",
+            agent_name=approval.agent_name,
+            content=f"Approval denied for {approval.agent_name}",
+            payload={
+                "approval_id": approval.id,
+                "status": APPROVAL_STATUS_DENIED,
+            },
+        )
+        await _emit_event(denied_event, on_event)
+        await _emit_run_update(run, on_run_update)
+    await _emit_approval(approval, on_approval)
+    await db.flush()
+    return approval

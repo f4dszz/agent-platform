@@ -13,6 +13,8 @@ from app.models.collaboration_run import CollaborationRun
 from app.models.message import Message
 from app.models.room import Room
 from app.services.agent_memory_store import refresh_agent_memory_summary
+from app.services.claude_agent import ClaudeAgent
+from app.services.codex_agent import CodexAgent
 from app.services.orchestrator import (
     _build_prompt_with_history,
     _build_review_prompt,
@@ -768,6 +770,91 @@ class SessionManagerTests(unittest.TestCase):
 
         manager.finish_run("claude")
         self.assertFalse(manager.get_session("claude")["busy"])
+
+
+class AgentWrapperCommandTests(unittest.TestCase):
+    def test_codex_accept_edits_uses_full_auto(self):
+        agent = CodexAgent(permission_mode="acceptEdits")
+
+        command = agent.build_command("say hello")
+
+        self.assertEqual(command[:3], ["codex", "exec", "--full-auto"])
+        self.assertNotIn("--sandbox", command)
+        self.assertEqual(command[-1], "say hello")
+
+    def test_codex_bypass_permissions_uses_dangerous_flag(self):
+        agent = CodexAgent(permission_mode="bypassPermissions")
+
+        command = agent.build_command("say hello")
+
+        self.assertEqual(
+            command[:3],
+            ["codex", "exec", "--dangerously-bypass-approvals-and-sandbox"],
+        )
+        self.assertNotIn("--sandbox", command)
+
+    def test_codex_plan_mode_keeps_read_only_sandbox(self):
+        agent = CodexAgent(permission_mode="plan")
+
+        command = agent.build_command("say hello")
+
+        self.assertEqual(
+            command,
+            ["codex", "exec", "--sandbox", "read-only", "say hello"],
+        )
+
+    def test_codex_default_args_are_inserted_before_prompt(self):
+        agent = CodexAgent(
+            permission_mode="acceptEdits",
+            default_args='["--model", "gpt-5.2"]',
+        )
+
+        command = agent.build_command("say hello")
+
+        self.assertEqual(
+            command,
+            ["codex", "exec", "--full-auto", "--model", "gpt-5.2", "say hello"],
+        )
+
+    def test_codex_prepare_command_uses_stdin_mode(self):
+        agent = CodexAgent(permission_mode="acceptEdits")
+
+        command, stdin_data = agent._prepare_command("say hello")
+
+        self.assertEqual(
+            command,
+            [
+                "codex",
+                "exec",
+                "--full-auto",
+                "-",
+            ],
+        )
+        self.assertEqual(stdin_data, b"say hello")
+
+    def test_claude_default_args_are_inserted_before_prompt(self):
+        agent = ClaudeAgent(
+            permission_mode="acceptEdits",
+            default_args="--model sonnet --verbose",
+        )
+
+        command = agent.build_command("summarize this")
+
+        self.assertEqual(
+            command,
+            [
+                "claude",
+                "-p",
+                "--output-format",
+                "json",
+                "--permission-mode",
+                "acceptEdits",
+                "--model",
+                "sonnet",
+                "--verbose",
+                "summarize this",
+            ],
+        )
 
 
 class AgentSessionReuseTests(unittest.IsolatedAsyncioTestCase):

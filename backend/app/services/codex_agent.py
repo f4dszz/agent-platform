@@ -5,6 +5,7 @@ Parses the verbose output to extract the final agent response.
 """
 
 import logging
+import subprocess
 
 from app.services.cli_wrapper import CLIAgent
 
@@ -43,6 +44,15 @@ class CodexAgent(CLIAgent):
         "default": "read-only",
     }
 
+    _EXECUTION_MODE_FLAGS = {
+        # `codex exec` does not support `--ask-for-approval`; use its native
+        # non-interactive modes and keep the prompt on stdin.
+        "acceptEdits": ["--full-auto"],
+        "plan": ["--sandbox", "read-only"],
+        "default": ["--sandbox", "read-only"],
+        "bypassPermissions": ["--dangerously-bypass-approvals-and-sandbox"],
+    }
+
     def build_command(self, message: str, session_id: str | None = None) -> list[str]:
         """Build the codex CLI command.
 
@@ -54,15 +64,38 @@ class CodexAgent(CLIAgent):
         if self.system_prompt:
             prompt = f"{self.system_prompt}\n\n{message}"
 
-        sandbox = self._SANDBOX_MAP.get(self.permission_mode, "read-only")
-
         cmd = [
             self.command,
             "exec",
-            "--sandbox", sandbox,
-            prompt,
         ]
+        if self.model:
+            cmd.extend(["--model", self.model])
+        cmd.extend(self._EXECUTION_MODE_FLAGS.get(self.permission_mode, []))
+
+        cmd.extend(self.get_default_args())
+        cmd.append(prompt)
         return cmd
+
+    def _prepare_command(
+        self,
+        message: str,
+        session_id: str | None = None,
+    ) -> tuple[list[str], bytes | None]:
+        """Always pipe the final prompt over stdin for Codex.
+
+        Codex prompts include the collaboration system prompt, which is multiline.
+        Passing embedded newlines through the Windows shell can corrupt the prompt,
+        so we explicitly switch Codex to stdin mode via a trailing `-`.
+        """
+        cmd = self.build_command(message, session_id)
+        prompt = cmd[-1]
+        stdin_data = prompt.encode("utf-8")
+        cmd = [*cmd[:-1], "-"]
+
+        if self.command == "codex":
+            logger.info("Codex shell command: %s", subprocess.list2cmdline(cmd)[:200])
+
+        return cmd, stdin_data
 
     def parse_output(self, raw: str) -> str:
         """Parse Codex exec output.

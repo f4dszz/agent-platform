@@ -5,7 +5,9 @@ Each agent type (Claude, Codex, etc.) subclasses CLIAgent and implements
 """
 
 import asyncio
+import json
 import logging
+import shlex
 import subprocess
 import sys
 from abc import ABC, abstractmethod
@@ -25,15 +27,19 @@ class CLIAgent(ABC):
         self,
         command: str,
         timeout: int = 300,
+        model: str | None = None,
         permission_mode: str = "acceptEdits",
         allowed_tools: str | None = None,
         system_prompt: str | None = None,
+        default_args: str | None = None,
     ):
         self.command = command
         self.timeout = timeout
+        self.model = model
         self.permission_mode = permission_mode
         self.allowed_tools = allowed_tools
         self.system_prompt = system_prompt
+        self.default_args = default_args
         self._last_session_id: str | None = None
 
     @property
@@ -63,6 +69,35 @@ class CLIAgent(ABC):
         Return None when a provider does not support meaningful live previews.
         """
         return None
+
+    def get_default_args(self) -> list[str]:
+        """Parse persisted default args from JSON or shell-style text."""
+        if not self.default_args:
+            return []
+
+        raw = self.default_args.strip()
+        if not raw:
+            return []
+
+        try:
+            parsed = json.loads(raw)
+        except json.JSONDecodeError:
+            parsed = None
+
+        if isinstance(parsed, list):
+            return [str(item) for item in parsed]
+
+        if isinstance(parsed, str):
+            raw = parsed
+        elif parsed is not None:
+            logger.warning("Ignoring unsupported default_args value: %r", parsed)
+            return []
+
+        try:
+            return shlex.split(raw, posix=not IS_WINDOWS)
+        except ValueError:
+            logger.warning("Falling back to a single CLI argument for default_args: %s", raw)
+            return [raw]
 
     def _prepare_command(
         self,
@@ -94,6 +129,23 @@ class CLIAgent(ABC):
                 stdout=asyncio.subprocess.PIPE,
                 stderr=asyncio.subprocess.PIPE,
             )
+
+    async def _write_stdin(
+        self,
+        process: asyncio.subprocess.Process,
+        stdin_data: bytes | None,
+    ) -> None:
+        """Write prompt data to stdin for providers that read from a pipe."""
+        if not stdin_data or process.stdin is None:
+            return
+
+        process.stdin.write(stdin_data)
+        await process.stdin.drain()
+        process.stdin.close()
+        try:
+            await process.stdin.wait_closed()
+        except (AttributeError, BrokenPipeError):
+            pass
 
     async def send(self, message: str, session_id: str | None = None) -> str:
         """Spawn the CLI subprocess, pipe the message, and return the response."""
@@ -146,6 +198,7 @@ class CLIAgent(ABC):
         process = await self._spawn(cmd, stdin_data)
 
         try:
+            await self._write_stdin(process, stdin_data)
             assert process.stdout is not None
             while True:
                 chunk = await asyncio.wait_for(
@@ -161,9 +214,9 @@ class CLIAgent(ABC):
                 process.kill()
             except ProcessLookupError:
                 pass
-                raise TimeoutError(
-                    f"Agent did not respond within {self.timeout} seconds"
-                )
+            raise TimeoutError(
+                f"Agent did not respond within {self.timeout} seconds"
+            )
 
     async def send_with_stream(
         self,
@@ -206,7 +259,11 @@ class CLIAgent(ABC):
                 stderr_parts.append(chunk.decode("utf-8", errors="replace"))
 
         try:
-            await asyncio.gather(read_stdout(), read_stderr())
+            await asyncio.gather(
+                self._write_stdin(process, stdin_data),
+                read_stdout(),
+                read_stderr(),
+            )
             await process.wait()
 
             stdout_text = "".join(stdout_parts).strip()

@@ -32,6 +32,15 @@ class Room(Base):
     agent_artifacts: Mapped[list["AgentArtifact"]] = relationship(  # noqa: F821
         back_populates="room", cascade="all, delete-orphan", lazy="selectin"
     )
+    run_steps: Mapped[list["RunStep"]] = relationship(  # noqa: F821
+        back_populates="room", cascade="all, delete-orphan", lazy="selectin"
+    )
+    agent_events: Mapped[list["AgentEvent"]] = relationship(  # noqa: F821
+        back_populates="room", cascade="all, delete-orphan", lazy="selectin"
+    )
+    approval_requests: Mapped[list["ApprovalRequest"]] = relationship(  # noqa: F821
+        back_populates="room", cascade="all, delete-orphan", lazy="selectin"
+    )
 
     def __repr__(self) -> str:
         return f"<Room {self.name}>"

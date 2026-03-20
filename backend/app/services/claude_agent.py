@@ -29,6 +29,9 @@ class ClaudeAgent(CLIAgent):
             "--output-format", "json",
         ]
 
+        if self.model:
+            cmd.extend(["--model", self.model])
+
         # Permission mode
         if self.permission_mode == "bypassPermissions":
             cmd.append("--dangerously-skip-permissions")
@@ -46,6 +49,7 @@ class ClaudeAgent(CLIAgent):
         if session_id:
             cmd.extend(["--session-id", session_id])
 
+        cmd.extend(self.get_default_args())
         cmd.append(message)
 
         return cmd
