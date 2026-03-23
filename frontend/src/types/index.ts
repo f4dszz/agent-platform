@@ -26,6 +26,7 @@ export interface Agent {
   agent_type: "claude" | "codex";
   command: string;
   model: string | null;
+  reasoning_effort: string | null;
   default_args: string | null;
   enabled: boolean;
   max_timeout: number;
@@ -35,6 +36,32 @@ export interface Agent {
   avatar_color: string | null;
   system_prompt: string | null;
   created_at: string;
+}
+
+export interface AgentConfigOption {
+  value: string;
+  label: string;
+  description: string | null;
+}
+
+export interface AgentCapabilities {
+  agent_name: string;
+  agent_type: "claude" | "codex";
+  model_placeholder: string;
+  model_help: string | null;
+  model_options: AgentConfigOption[];
+  reasoning_supported: boolean;
+  reasoning_label: string | null;
+  reasoning_help: string | null;
+  reasoning_options: AgentConfigOption[];
+  execution_label: string;
+  execution_help: string | null;
+  execution_options: AgentConfigOption[];
+  tool_rules_supported: boolean;
+  tool_rules_label: string | null;
+  tool_rules_help: string | null;
+  tool_rules_placeholder: string | null;
+  advanced_fields: string[];
 }
 
 export interface AgentStatus {
@@ -171,6 +198,16 @@ export interface WSErrorMessage {
   content: string;
 }
 
+export interface WSRoomCreatedMessage extends Room {
+  type: "room_created";
+}
+
+export interface WSRoomDeletedMessage {
+  type: "room_deleted";
+  room_id: string;
+  name: string | null;
+}
+
 export type WSIncomingMessage =
   | WSChatMessage
   | WSStreamChunkMessage
@@ -180,6 +217,11 @@ export type WSIncomingMessage =
   | WSRunStepMessage
   | WSAgentEventMessage
   | WSApprovalRequestMessage
+  | WSErrorMessage;
+
+export type WSRoomLifecycleMessage =
+  | WSRoomCreatedMessage
+  | WSRoomDeletedMessage
   | WSErrorMessage;
 
 export interface WSOutgoingMessage {

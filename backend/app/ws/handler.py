@@ -21,6 +21,7 @@ from app.services.orchestrator import route_message
 logger = logging.getLogger(__name__)
 
 router = APIRouter()
+ROOM_LIFECYCLE_CHANNEL = "__rooms__"
 
 
 class ConnectionManager:
@@ -60,8 +61,35 @@ class ConnectionManager:
             self._rooms[room_id].discard(ws)
             self._send_locks.pop(ws, None)
 
+    async def close_room(
+        self,
+        room_id: str,
+        data: dict | None = None,
+        *,
+        close_code: int = 4404,
+    ) -> None:
+        if room_id not in self._rooms:
+            return
+        payload = json.dumps(data) if data else None
+        sockets = list(self._rooms.get(room_id, set()))
+        for ws in sockets:
+            lock = self._send_locks.setdefault(ws, asyncio.Lock())
+            try:
+                async with lock:
+                    if payload:
+                        await ws.send_text(payload)
+                    await ws.close(code=close_code)
+            except Exception:
+                logger.warning("WS close failed room=%s", room_id, exc_info=True)
+            finally:
+                self._rooms.get(room_id, set()).discard(ws)
+                self._send_locks.pop(ws, None)
+        if room_id in self._rooms and not self._rooms[room_id]:
+            del self._rooms[room_id]
+
 
 manager = ConnectionManager()
+lifecycle_manager = ConnectionManager()
 
 
 async def _room_exists(db, room_id: str) -> bool:
@@ -180,6 +208,44 @@ def approval_to_dict(approval: ApprovalRequest) -> dict:
         "created_at": approval.created_at.isoformat() if approval.created_at else None,
         "resolved_at": approval.resolved_at.isoformat() if approval.resolved_at else None,
     }
+
+
+def room_created_to_dict(room: Room) -> dict:
+    return {
+        "type": "room_created",
+        "id": room.id,
+        "name": room.name,
+        "description": room.description,
+        "created_at": room.created_at.isoformat() if room.created_at else None,
+    }
+
+
+def room_deleted_to_dict(room_id: str, name: str | None = None) -> dict:
+    return {
+        "type": "room_deleted",
+        "room_id": room_id,
+        "name": name,
+    }
+
+
+@router.websocket("/ws/lifecycle/rooms")
+async def room_lifecycle_websocket(websocket: WebSocket):
+    await lifecycle_manager.connect(websocket, ROOM_LIFECYCLE_CHANNEL)
+
+    try:
+        while True:
+            raw = await websocket.receive_text()
+            try:
+                data = json.loads(raw)
+            except json.JSONDecodeError:
+                continue
+            if data.get("type") == "ping":
+                await websocket.send_text(json.dumps({"type": "pong"}))
+    except WebSocketDisconnect:
+        lifecycle_manager.disconnect(websocket, ROOM_LIFECYCLE_CHANNEL)
+    except Exception as e:
+        logger.error("Room lifecycle WebSocket error: %s", e, exc_info=True)
+        lifecycle_manager.disconnect(websocket, ROOM_LIFECYCLE_CHANNEL)
 
 
 @router.websocket("/ws/{room_id}")

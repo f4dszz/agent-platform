@@ -1,6 +1,8 @@
 import asyncio
+import logging
 
 from fastapi import APIRouter, Depends, HTTPException, Query
+from pydantic import BaseModel
 from sqlalchemy import func, select
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -22,6 +24,8 @@ from app.schemas.schemas import (
 )
 from app.services.collaboration_runtime import APPROVAL_STATUS_APPROVED, resolve_approval
 from app.services.orchestrator import deny_approval_request, resume_approval_request
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 
@@ -226,6 +230,34 @@ async def get_run(run_id: str, db: AsyncSession = Depends(get_db)):
     return run
 
 
+class RunLimitsUpdate(BaseModel):
+    max_steps: int | None = None
+    max_review_rounds: int | None = None
+
+
+@router.patch("/runs/{run_id}/limits", response_model=CollaborationRunResponse)
+async def update_run_limits(
+    run_id: str,
+    body: RunLimitsUpdate,
+    db: AsyncSession = Depends(get_db),
+):
+    result = await db.execute(
+        select(CollaborationRun).where(CollaborationRun.id == run_id)
+    )
+    run = result.scalar_one_or_none()
+    if not run:
+        raise HTTPException(status_code=404, detail="Run not found")
+    if body.max_steps is not None:
+        run.max_steps = max(1, min(body.max_steps, 50))
+    if body.max_review_rounds is not None:
+        run.max_review_rounds = max(1, min(body.max_review_rounds, 20))
+    await db.commit()
+    await db.refresh(run)
+    callbacks = await _build_broadcast_callbacks(run.room_id)
+    await callbacks["on_run_update"](run)
+    return run
+
+
 @router.get("/runs/{run_id}/artifacts", response_model=AgentArtifactList)
 async def list_run_artifacts(run_id: str, db: AsyncSession = Depends(get_db)):
     run_result = await db.execute(
@@ -334,14 +366,22 @@ async def approve_approval(
     await db.commit()
 
     async def _resume_background() -> None:
-        async with async_session() as session:
-            bg_callbacks = await _build_broadcast_callbacks(approval.room_id)
-            await resume_approval_request(
-                approval_id,
-                session,
-                **bg_callbacks,
-            )
-            await session.commit()
+        try:
+            async with async_session() as session:
+                bg_callbacks = await _build_broadcast_callbacks(approval.room_id)
+                await asyncio.wait_for(
+                    resume_approval_request(
+                        approval_id,
+                        session,
+                        **bg_callbacks,
+                    ),
+                    timeout=600,
+                )
+                await session.commit()
+        except asyncio.TimeoutError:
+            logger.error("Approval resume timed out for %s", approval_id)
+        except Exception:
+            logger.error("Approval resume failed for %s", approval_id, exc_info=True)
 
     asyncio.create_task(_resume_background())
     return approval
@@ -366,5 +406,6 @@ async def deny_approval(
         on_run_update=callbacks["on_run_update"],
         on_event=callbacks["on_event"],
         on_approval=callbacks["on_approval"],
+        on_response=callbacks["on_response"],
     )
     return denied

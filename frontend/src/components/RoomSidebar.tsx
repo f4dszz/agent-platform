@@ -1,6 +1,6 @@
-import { useState, useEffect } from "react";
+import { useState, useEffect, useCallback } from "react";
 import type { Room, Agent } from "../types";
-import { listAgents } from "../services/api";
+import { listAgents, batchDeleteRooms } from "../services/api";
 import { useTheme, t, type ThemeMode, type BubbleStyle } from "./ThemeContext";
 import AgentSettings from "./AgentSettings";
 
@@ -10,6 +10,7 @@ interface RoomSidebarProps {
   onSelectRoom: (roomId: string) => void;
   onCreateRoom: (name: string) => void;
   onDeleteRoom: (roomId: string) => Promise<void>;
+  onRoomsChanged: () => void;
   agentStatuses: Record<string, "idle" | "working" | "offline">;
   onAgentStatusPatch: (name: string, status: "idle" | "working" | "offline") => void;
   onAgentConfigChange: () => void;
@@ -21,6 +22,7 @@ export default function RoomSidebar({
   onSelectRoom,
   onCreateRoom,
   onDeleteRoom,
+  onRoomsChanged,
   agentStatuses,
   onAgentStatusPatch,
   onAgentConfigChange,
@@ -33,9 +35,19 @@ export default function RoomSidebar({
   const [agents, setAgents] = useState<Agent[]>([]);
   const [expandedAgent, setExpandedAgent] = useState<string | null>(null);
 
+  // Batch delete state
+  const [batchMode, setBatchMode] = useState(false);
+  const [selected, setSelected] = useState<Set<string>>(new Set());
+  const [deleting, setDeleting] = useState(false);
+
   useEffect(() => {
     listAgents().then(setAgents).catch(console.error);
   }, []);
+
+  // Reset selection when exiting batch mode
+  useEffect(() => {
+    if (!batchMode) setSelected(new Set());
+  }, [batchMode]);
 
   const handleCreate = () => {
     const name = newRoomName.trim();
@@ -44,6 +56,39 @@ export default function RoomSidebar({
     setNewRoomName("");
     setShowCreate(false);
   };
+
+  const toggleSelect = useCallback((roomId: string) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      if (next.has(roomId)) next.delete(roomId);
+      else next.add(roomId);
+      return next;
+    });
+  }, []);
+
+  const toggleSelectAll = useCallback(() => {
+    setSelected((prev) => {
+      if (prev.size === rooms.length) return new Set();
+      return new Set(rooms.map((r) => r.id));
+    });
+  }, [rooms]);
+
+  const handleBatchDelete = useCallback(async () => {
+    if (selected.size === 0) return;
+    const count = selected.size;
+    if (!window.confirm(`Delete ${count} room${count > 1 ? "s" : ""}?`)) return;
+    setDeleting(true);
+    try {
+      await batchDeleteRooms([...selected]);
+      onRoomsChanged();
+      setSelected(new Set());
+      setBatchMode(false);
+    } catch (err) {
+      console.error("Batch delete failed:", err);
+    } finally {
+      setDeleting(false);
+    }
+  }, [selected, onRoomsChanged]);
 
   const themes: { key: ThemeMode; label: string }[] = [
     { key: "dark", label: "Dark" },
@@ -124,13 +169,28 @@ export default function RoomSidebar({
           <span className={`text-[10px] font-semibold ${tk.textMuted} uppercase tracking-widest`}>
             Rooms
           </span>
-          <button
-            onClick={() => setShowCreate(!showCreate)}
-            className={`${tk.textMuted} hover:text-blue-400 text-base leading-none transition-colors w-5 h-5 flex items-center justify-center rounded ${tk.sidebarHover}`}
-            title="Create room"
-          >
-            +
-          </button>
+          <div className="flex items-center gap-0.5">
+            {rooms.length > 0 && (
+              <button
+                onClick={() => setBatchMode(!batchMode)}
+                className={`text-[10px] px-1.5 py-0.5 rounded transition-colors ${
+                  batchMode
+                    ? "bg-rose-600/20 text-rose-400"
+                    : `${tk.textMuted} hover:text-rose-400 ${tk.sidebarHover}`
+                }`}
+                title={batchMode ? "Cancel batch mode" : "Batch delete"}
+              >
+                {batchMode ? "Cancel" : "Batch"}
+              </button>
+            )}
+            <button
+              onClick={() => setShowCreate(!showCreate)}
+              className={`${tk.textMuted} hover:text-blue-400 text-base leading-none transition-colors w-5 h-5 flex items-center justify-center rounded ${tk.sidebarHover}`}
+              title="Create room"
+            >
+              +
+            </button>
+          </div>
         </div>
 
         {showCreate && (
@@ -153,6 +213,25 @@ export default function RoomSidebar({
           </div>
         )}
 
+        {/* Batch actions bar */}
+        {batchMode && (
+          <div className="mx-1 mb-2 flex items-center justify-between gap-1">
+            <button
+              onClick={toggleSelectAll}
+              className={`text-[11px] px-2 py-1 rounded-lg ${tk.bgTertiary} ${tk.textSecondary} hover:${tk.text}`}
+            >
+              {selected.size === rooms.length ? "Deselect All" : "Select All"}
+            </button>
+            <button
+              onClick={handleBatchDelete}
+              disabled={selected.size === 0 || deleting}
+              className="text-[11px] px-2 py-1 rounded-lg bg-rose-600 text-white hover:bg-rose-500 disabled:opacity-40 disabled:cursor-not-allowed"
+            >
+              {deleting ? "Deleting..." : `Delete (${selected.size})`}
+            </button>
+          </div>
+        )}
+
         {rooms.map((room) => (
           <div
             key={room.id}
@@ -162,23 +241,35 @@ export default function RoomSidebar({
                 : `${tk.textSecondary} ${tk.sidebarHover} border-transparent`
             }`}
           >
+            {batchMode && (
+              <label className="flex items-center pl-2 cursor-pointer">
+                <input
+                  type="checkbox"
+                  checked={selected.has(room.id)}
+                  onChange={() => toggleSelect(room.id)}
+                  className="w-3.5 h-3.5 rounded accent-rose-500 cursor-pointer"
+                />
+              </label>
+            )}
             <button
-              onClick={() => onSelectRoom(room.id)}
+              onClick={() => batchMode ? toggleSelect(room.id) : onSelectRoom(room.id)}
               className="flex-1 text-left px-3 py-2 text-sm transition-all"
             >
               <span className={tk.textDim + " mr-1"}>#</span>
               {room.name}
             </button>
-            <button
-              onClick={async () => {
-                if (!window.confirm(`Delete room "${room.name}"?`)) return;
-                await onDeleteRoom(room.id);
-              }}
-              className={`mr-1 hidden group-hover:flex items-center justify-center rounded-md px-2 py-1 text-[11px] ${tk.textMuted} hover:text-rose-400`}
-              title="Delete room"
-            >
-              Del
-            </button>
+            {!batchMode && (
+              <button
+                onClick={async () => {
+                  if (!window.confirm(`Delete room "${room.name}"?`)) return;
+                  await onDeleteRoom(room.id);
+                }}
+                className={`mr-1 hidden group-hover:flex items-center justify-center rounded-md px-2 py-1 text-[11px] ${tk.textMuted} hover:text-rose-400`}
+                title="Delete room"
+              >
+                Del
+              </button>
+            )}
           </div>
         ))}
 

@@ -2,6 +2,7 @@
 
 import type {
   Agent,
+  AgentCapabilities,
   AgentArtifact,
   AgentEvent,
   ApprovalRequest,
@@ -55,6 +56,13 @@ export async function deleteRoom(roomId: string): Promise<void> {
   return request(`/rooms/${roomId}`, { method: "DELETE" });
 }
 
+export async function batchDeleteRooms(roomIds: string[]): Promise<void> {
+  return request(`/rooms/batch-delete`, {
+    method: "POST",
+    body: JSON.stringify({ room_ids: roomIds }),
+  });
+}
+
 // ── Messages ─────────────────────────────────────────────────────────────────
 
 export async function listMessages(
@@ -71,12 +79,26 @@ export async function listAgents(): Promise<Agent[]> {
   return request("/agents/");
 }
 
+export async function getAgentCapabilities(agentName: string): Promise<AgentCapabilities> {
+  return request(`/agents/${agentName}/capabilities`);
+}
+
 export async function listRoomRuns(
   roomId: string,
   limit = 20,
   offset = 0
 ): Promise<{ runs: CollaborationRun[]; total: number }> {
   return request(`/collaboration/rooms/${roomId}/runs?limit=${limit}&offset=${offset}`);
+}
+
+export async function updateRunLimits(
+  runId: string,
+  limits: { max_steps?: number; max_review_rounds?: number }
+): Promise<CollaborationRun> {
+  return request(`/collaboration/runs/${runId}/limits`, {
+    method: "PATCH",
+    body: JSON.stringify(limits),
+  });
 }
 
 export async function listRoomArtifacts(
@@ -125,6 +147,7 @@ export async function registerAgent(agent: {
   agent_type: "claude" | "codex";
   command: string;
   model?: string | null;
+  reasoning_effort?: string | null;
   default_args?: string;
   max_timeout?: number;
   avatar_label?: string | null;
@@ -146,6 +169,7 @@ export async function updateAgent(
     display_name?: string;
     command?: string;
     model?: string | null;
+    reasoning_effort?: string | null;
     default_args?: string | null;
     permission_mode?: string;
     allowed_tools?: string | null;

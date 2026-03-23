@@ -1,4 +1,4 @@
-import { useState, useRef, type KeyboardEvent } from "react";
+import { useState, useRef, useCallback, type KeyboardEvent } from "react";
 import { useTheme, t } from "./ThemeContext";
 
 interface MessageInputProps {
@@ -19,6 +19,11 @@ export default function MessageInput({
   const [suggestions, setSuggestions] = useState<string[]>([]);
   const [selectedIdx, setSelectedIdx] = useState(0);
   const inputRef = useRef<HTMLTextAreaElement>(null);
+
+  // Input history (↑/↓ to navigate)
+  const historyRef = useRef<string[]>([]);
+  const historyIdxRef = useRef(-1);
+  const draftRef = useRef("");
 
   const handleChange = (text: string) => {
     setValue(text);
@@ -45,14 +50,21 @@ export default function MessageInput({
     inputRef.current?.focus();
   };
 
-  const handleSubmit = () => {
+  const handleSubmit = useCallback(() => {
     const trimmed = value.trim();
     if (!trimmed) return;
     onSend(trimmed);
+    // Push to history (avoid consecutive duplicates)
+    const hist = historyRef.current;
+    if (hist.length === 0 || hist[hist.length - 1] !== trimmed) {
+      hist.push(trimmed);
+    }
+    historyIdxRef.current = -1;
+    draftRef.current = "";
     setValue("");
     setShowSuggestions(false);
     setSelectedIdx(0);
-  };
+  }, [value, onSend]);
 
   const handleKeyDown = (e: KeyboardEvent) => {
     if (showSuggestions && suggestions.length > 0) {
@@ -76,6 +88,39 @@ export default function MessageInput({
       if (e.key === "Escape") {
         e.preventDefault();
         setShowSuggestions(false);
+        return;
+      }
+    }
+
+    // ↑/↓ history navigation (only when cursor is at the start of input)
+    const hist = historyRef.current;
+    if (e.key === "ArrowUp" && !showSuggestions && hist.length > 0) {
+      const el = inputRef.current;
+      const atStart = !el || el.selectionStart === 0;
+      if (atStart) {
+        e.preventDefault();
+        if (historyIdxRef.current === -1) {
+          draftRef.current = value;
+          historyIdxRef.current = hist.length - 1;
+        } else if (historyIdxRef.current > 0) {
+          historyIdxRef.current -= 1;
+        }
+        setValue(hist[historyIdxRef.current]);
+        return;
+      }
+    }
+    if (e.key === "ArrowDown" && !showSuggestions && historyIdxRef.current >= 0) {
+      const el = inputRef.current;
+      const atEnd = !el || el.selectionStart === el.value.length;
+      if (atEnd) {
+        e.preventDefault();
+        if (historyIdxRef.current < hist.length - 1) {
+          historyIdxRef.current += 1;
+          setValue(hist[historyIdxRef.current]);
+        } else {
+          historyIdxRef.current = -1;
+          setValue(draftRef.current);
+        }
         return;
       }
     }

@@ -28,6 +28,9 @@ class AgentConfig(Base):
     model: Mapped[str | None] = mapped_column(
         String(120), nullable=True
     )  # Provider model identifier
+    reasoning_effort: Mapped[str | None] = mapped_column(
+        String(20), nullable=True
+    )  # Provider reasoning / effort setting
     default_args: Mapped[str | None] = mapped_column(
         Text, nullable=True
     )  # JSON string of default arguments

@@ -58,6 +58,7 @@ class AgentRegister(BaseModel):
     agent_type: str = Field(..., pattern=r"^(claude|codex)$")
     command: str = Field(..., max_length=500)
     model: str | None = Field(default=None, max_length=120)
+    reasoning_effort: str | None = Field(default=None, max_length=20)
     default_args: str | None = None
     max_timeout: int = Field(default=300, ge=10, le=3600)
     permission_mode: str = Field(default="acceptEdits", max_length=30)
@@ -71,6 +72,7 @@ class AgentUpdate(BaseModel):
     display_name: str | None = None
     command: str | None = Field(default=None, max_length=500)
     model: str | None = Field(default=None, max_length=120)
+    reasoning_effort: str | None = Field(default=None, max_length=20)
     default_args: str | None = None
     permission_mode: str | None = None
     allowed_tools: str | None = None
@@ -87,6 +89,7 @@ class AgentResponse(BaseModel):
     agent_type: str
     command: str
     model: str | None
+    reasoning_effort: str | None
     default_args: str | None
     enabled: bool
     max_timeout: int
@@ -98,6 +101,32 @@ class AgentResponse(BaseModel):
     created_at: datetime
 
     model_config = {"from_attributes": True}
+
+
+class AgentConfigOption(BaseModel):
+    value: str
+    label: str
+    description: str | None = None
+
+
+class AgentCapabilitiesResponse(BaseModel):
+    agent_name: str
+    agent_type: str
+    model_placeholder: str
+    model_help: str | None = None
+    model_options: list[AgentConfigOption]
+    reasoning_supported: bool = False
+    reasoning_label: str | None = None
+    reasoning_help: str | None = None
+    reasoning_options: list[AgentConfigOption] = Field(default_factory=list)
+    execution_label: str
+    execution_help: str | None = None
+    execution_options: list[AgentConfigOption]
+    tool_rules_supported: bool = False
+    tool_rules_label: str | None = None
+    tool_rules_help: str | None = None
+    tool_rules_placeholder: str | None = None
+    advanced_fields: list[str] = Field(default_factory=list)
 
 
 class AgentStatusResponse(BaseModel):

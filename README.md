@@ -1,20 +1,18 @@
 # Agent Platform
 
-A multi-agent chat platform where humans and CLI-based AI agents (Claude Code, Codex CLI, etc.) communicate in a shared chat room via web/mobile.
+A shared-room collaboration platform for humans and CLI agents such as Claude
+Code and Codex CLI.
 
-多 Agent 聊天平台：人类与 CLI AI 代理（Claude Code、Codex CLI 等）在共享聊天室中实时对话。
+## Stack
 
-## Tech Stack / 技术栈
+- Frontend: React, Vite, TypeScript, Tailwind CSS
+- Backend: FastAPI, SQLAlchemy, SQLite for local development
+- Realtime: WebSocket
+- Agents: Claude Code CLI and Codex CLI
 
-- **Frontend 前端:** React + Vite + TypeScript + Tailwind CSS
-- **Backend 后端:** Python + FastAPI
-- **Database 数据库:** SQLite (dev) / PostgreSQL (prod)
-- **Real-time 实时通信:** WebSocket
-- **CLI Agents 代理:** Claude Code (`claude -p`), Codex CLI (`codex`)
+## Quick Start
 
-## Quick Start / 快速启动
-
-### 1. Start the backend / 启动后端
+### Backend
 
 ```bash
 cd backend
@@ -22,74 +20,123 @@ pip install -r requirements.txt
 python -m uvicorn app.main:app --host 127.0.0.1 --port 8001
 ```
 
-> Note / 注意: Use `python -m uvicorn` (not bare `uvicorn`) to ensure the correct Python version. Do NOT use `--reload` on Windows — it causes zombie worker processes.
->
-> 使用 `python -m uvicorn`（而非直接 `uvicorn`）确保正确的 Python 版本。Windows 上不要用 `--reload`，会导致僵尸子进程堆叠。
+Use `python -m uvicorn` rather than bare `uvicorn`. On Windows, avoid
+`--reload` because it tends to leave zombie worker processes behind.
 
-### 2. Start the frontend / 启动前端
+### Frontend
 
 ```bash
 cd frontend
-bun install   # or npm install / 或 npm install
-npx vite --port 5173
+npm install
+npm run dev -- --port 5173
 ```
 
-### 3. Use the app / 使用应用
+### App
 
-1. Open / 打开 http://localhost:5173
-2. Create a room / 创建聊天室
-3. Type a message — it appears in real time / 输入消息——实时显示
-4. Type `@claude hello` — Claude Code CLI responds / 输入 `@claude hello`——Claude Code 回复
-5. Type `@codex hello` — Codex CLI responds / 输入 `@codex hello`——Codex CLI 回复
-6. Type `@all summarize this file` — both agents respond / 输入 `@all`——所有代理回复
+1. Open `http://127.0.0.1:5173`
+2. Create a room
+3. Send a human message or mention an agent such as `@claude` or `@codex`
 
-## Message Routing / 消息路由
+## Message Routing
 
-| Syntax 语法 | Behavior 行为 |
-|--------|----------|
-| `@claude <msg>` | Send to Claude Code only / 仅发送给 Claude Code |
-| `@codex <msg>` | Send to Codex CLI only / 仅发送给 Codex CLI |
-| `@all <msg>` | Send to all enabled agents / 发送给所有启用的代理 |
-| No mention 无 @ | Human chat — no agent auto-reply / 人类聊天，代理不自动回复 |
+| Syntax | Behavior |
+| --- | --- |
+| `@claude <msg>` | Send only to Claude Code |
+| `@codex <msg>` | Send only to Codex CLI |
+| `@all <msg>` | Send to all enabled agents |
+| no mention | Human-only chat, no automatic agent reply |
 
-## Agent Configuration / Agent 配置
+## Agent Settings
 
-Each agent has configurable settings editable from the sidebar:
+Agent settings are provider-aware and loaded from
+`GET /api/agents/{name}/capabilities`.
 
-每个 Agent 可在侧边栏中配置以下设置：
+Shared settings:
 
-- **Permission Mode / 权限模式**: Controls what the agent is allowed to do / 控制代理的操作权限
-  - `acceptEdits` — Allow file edits (recommended) / 允许编辑文件（推荐）
-  - `plan` — Plan only, no file operations / 仅规划，不操作文件
-  - `default` — Require confirmation (non-interactive = reject) / 需要确认（非交互=拒绝）
-  - `bypassPermissions` — Skip all checks (dangerous) / 跳过所有权限检查（危险）
-- **Allowed Tools / 允许的工具** (Claude only): Restrict which tools the agent can use (Read, Write, Edit, Bash, Glob, Grep) / 限制可用工具
-- **System Prompt / 人格提示词**: Inject a persona/role / 注入人格角色（如 "你是代码审核员..."）
+- `Enabled`
+- `Display Name`
+- `Model`
+- `Reasoning / Thinking` when supported
+- `Execution`
+- `Timeout`
+- `System Prompt`, `Default Args`, and `Command` under Advanced
 
-Settings are persisted to the database via `PATCH /api/agents/{name}`.
+Claude Code support:
 
-设置通过 `PATCH /api/agents/{name}` 持久化到数据库。
+- Suggested models: `sonnet`, `opus`
+- These aliases are described as the latest Sonnet 4.6 and Opus 4.6 family
+- Thinking levels map to `claude --effort` with `low`, `medium`, `high`, `max`
+- Tool rules are provider-native and are passed through as `--allowedTools`
 
-## Project Structure / 项目结构
+Codex support:
 
-```
+- Suggested models come from local Codex config when available
+- `gpt-5.4` is the default fallback recommendation
+- Reasoning levels map to `-c model_reasoning_effort=...`
+- Execution stays coarse because Codex CLI does not expose the same fine-grained
+  provider approval surface as Claude Code
+
+Settings are persisted through `PATCH /api/agents/{name}`.
+
+## Collaboration Runs
+
+The collaboration layer currently distinguishes between:
+
+- `deliverable` tasks such as plans, implementation work, and documents
+- `content_iteration` tasks such as jokes, naming, rewriting, and copywriting
+
+This prevents every multi-agent request from being forced into the same
+`plan -> review -> decision` flow.
+
+Current run model highlights:
+
+- lead-agent execution with reviewer follow-up
+- approval pause and resume
+- structured artifacts, steps, events, and approvals
+- run timelines in the frontend
+
+## Room Lifecycle
+
+- Room create and delete events are broadcast through `/ws/lifecycle/rooms`
+- Sidebar room lists stay in sync across clients
+- Batch deletion is available at `POST /api/rooms/batch-delete`
+
+## Project Structure
+
+```text
 agent-platform/
-├── frontend/                     # React + Vite + TypeScript
-│   └── src/
-│       ├── components/           # ChatRoom, MessageList, MessageInput, AgentSettings...
-│       ├── hooks/                # useWebSocket
-│       ├── services/             # REST API client / REST API 客户端
-│       └── types/                # Shared TypeScript types / 共享 TS 类型
-├── backend/                      # Python + FastAPI
-│   └── app/
-│       ├── main.py               # App entry, CORS, lifespan, seed agents / 应用入口
-│       ├── config.py             # Pydantic Settings / 配置
-│       ├── models/               # SQLAlchemy ORM (Room, Message, AgentConfig)
-│       ├── schemas/              # Pydantic request/response schemas / 请求响应模型
-│       ├── services/             # Orchestrator, CLI wrappers, session manager / 编排器
-│       ├── routers/              # REST endpoints (rooms, messages, agents)
-│       ├── ws/                   # WebSocket handler / WebSocket 处理器
-│       └── db/                   # Async SQLAlchemy engine / 异步数据库引擎
-├── docker-compose.yml            # PostgreSQL service (prod) / 生产数据库
-└── .env.example                  # Environment template / 环境变量模板
+|-- frontend/
+|   |-- src/
+|   |   |-- components/
+|   |   |-- hooks/
+|   |   |-- services/
+|   |   `-- types/
+|-- backend/
+|   |-- app/
+|   |   |-- db/
+|   |   |-- models/
+|   |   |-- routers/
+|   |   |-- schemas/
+|   |   |-- services/
+|   |   `-- ws/
+|   `-- tests/
+|-- docker-compose.yml
+`-- README.md
 ```
+
+## Notable Service Boundaries
+
+- `agent_capabilities.py`: provider-aware configuration metadata for the UI
+- `agent_execution.py`: provider invocation and session persistence
+- `step_execution.py`: single-step lifecycle, approval gating, and artifact persistence
+- `orchestrator.py`: run-level routing and collaboration loops
+- `prompt_builder.py`: prompt construction
+- `message_parser.py`: mention, handoff, and control syntax parsing
+- `run_hooks.py`: callback bundling for responses, streams, steps, and approvals
+
+## Current Limitations
+
+- Claude and Codex are not yet wired to provider-native event streams in the UI
+- Step/event logging is still coarse compared with a full debugging console
+- `orchestrator.py` has been reduced substantially but still carries run-level
+  workflow logic that can be split further

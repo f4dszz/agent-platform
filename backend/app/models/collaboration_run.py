@@ -24,8 +24,8 @@ class CollaborationRun(Base):
     status: Mapped[str] = mapped_column(String(20), default="running", nullable=False, index=True)
     step_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
     review_round_count: Mapped[int] = mapped_column(Integer, default=0, nullable=False)
-    max_steps: Mapped[int] = mapped_column(Integer, default=6, nullable=False)
-    max_review_rounds: Mapped[int] = mapped_column(Integer, default=2, nullable=False)
+    max_steps: Mapped[int] = mapped_column(Integer, default=12, nullable=False)
+    max_review_rounds: Mapped[int] = mapped_column(Integer, default=4, nullable=False)
     stop_reason: Mapped[str | None] = mapped_column(Text, nullable=True)
     created_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), default=lambda: datetime.now(timezone.utc)

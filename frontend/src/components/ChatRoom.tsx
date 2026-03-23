@@ -213,14 +213,6 @@ export default function ChatRoom({
     onMessage: handleWSMessage,
   });
 
-  const activeRun = runs.find((run) => run.status === "running") ?? runs[0] ?? null;
-  const activeRunId = activeRun?.id ?? null;
-  const activeSteps = activeRunId ? steps.filter((step) => step.run_id === activeRunId) : [];
-  const activeEvents = activeRunId ? events.filter((event) => event.run_id === activeRunId) : [];
-  const activeApprovals = activeRunId
-    ? approvals.filter((approval) => approval.run_id === activeRunId)
-    : [];
-
   return (
     <div className={`flex flex-col h-full ${tk.bg}`}>
       <div className={`px-5 py-3.5 border-b ${tk.borderLight} ${tk.bgSecondary}/80 backdrop-blur flex items-center justify-between`}>
@@ -243,10 +235,10 @@ export default function ChatRoom({
       </div>
 
       <RunTimeline
-        run={activeRun}
-        steps={activeSteps}
-        events={activeEvents}
-        approvals={activeApprovals}
+        runs={runs}
+        steps={steps}
+        events={events}
+        approvals={approvals}
         agents={agents}
         onJumpToMessage={(messageId) => {
           document.getElementById(`message-${messageId}`)?.scrollIntoView({
@@ -261,6 +253,9 @@ export default function ChatRoom({
         onDeny={async (approvalId) => {
           const approval = await denyApproval(approvalId);
           setApprovals((prev) => upsertById(prev, approval));
+        }}
+        onRunUpdated={(updated) => {
+          setRuns((prev) => upsertById(prev, updated));
         }}
       />
 

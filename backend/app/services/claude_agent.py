@@ -5,6 +5,7 @@ Uses `claude -p` for single-shot prompts with optional session continuity.
 
 import json
 import logging
+import re
 
 from app.services.cli_wrapper import CLIAgent
 
@@ -32,6 +33,9 @@ class ClaudeAgent(CLIAgent):
         if self.model:
             cmd.extend(["--model", self.model])
 
+        if self.reasoning_effort:
+            cmd.extend(["--effort", self.reasoning_effort])
+
         # Permission mode
         if self.permission_mode == "bypassPermissions":
             cmd.append("--dangerously-skip-permissions")
@@ -54,6 +58,34 @@ class ClaudeAgent(CLIAgent):
 
         return cmd
 
+    # Pattern to extract the result field from a potentially incomplete JSON stream.
+    # Claude -p outputs a single JSON blob at the end; sometimes stderr has progress text.
+    _RESULT_RE = re.compile(r'"result"\s*:\s*"((?:[^"\\]|\\.)*)"', re.DOTALL)
+
+    def build_stream_preview(self, raw: str) -> str | None:
+        """Try to extract a partial result from Claude JSON output.
+
+        Claude -p with --output-format json emits a single JSON object once
+        the response is complete.  During execution stdout may contain partial
+        JSON or non-JSON progress text.  We try to extract the ``result``
+        value early if possible, otherwise return any non-JSON text as a
+        progress indicator.
+        """
+        if not raw:
+            return None
+        # Try extracting "result" from partial JSON
+        m = self._RESULT_RE.search(raw)
+        if m:
+            try:
+                return json.loads(f'"{m.group(1)}"')
+            except (json.JSONDecodeError, UnicodeDecodeError):
+                return m.group(1)
+        # If stdout contains non-JSON text (progress/debug output), show it
+        stripped = raw.strip()
+        if stripped and not stripped.startswith("{"):
+            return stripped
+        return None
+
     def parse_output(self, raw: str) -> str:
         """Parse Claude's JSON output format.
 
@@ -74,7 +106,7 @@ class ClaudeAgent(CLIAgent):
 
                 # Check for errors
                 if data.get("is_error"):
-                    return f"⚠️ Agent error: {data.get('result', 'unknown error')}"
+                    return f"[Agent error] {data.get('result', 'unknown error')}"
 
                 if "result" in data:
                     return str(data["result"])

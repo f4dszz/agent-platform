@@ -21,6 +21,7 @@ SQLITE_AGENT_CONFIG_COLUMNS = {
     "allowed_tools": "TEXT",
     "system_prompt": "TEXT",
     "model": "VARCHAR(120)",
+    "reasoning_effort": "VARCHAR(20)",
     "avatar_label": "VARCHAR(8)",
     "avatar_color": "VARCHAR(40)",
 }
@@ -33,6 +34,7 @@ DEFAULT_AGENTS = [
         "agent_type": "claude",
         "command": "claude",
         "model": None,
+        "reasoning_effort": None,
         "max_timeout": 300,
         "permission_mode": "acceptEdits",
         "allowed_tools": None,
@@ -46,6 +48,7 @@ DEFAULT_AGENTS = [
         "agent_type": "codex",
         "command": "codex",
         "model": None,
+        "reasoning_effort": None,
         "max_timeout": 300,
         "permission_mode": "acceptEdits",
         "allowed_tools": None,

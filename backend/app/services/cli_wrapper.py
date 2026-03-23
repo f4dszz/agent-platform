@@ -16,8 +16,8 @@ from collections.abc import Awaitable, Callable
 logger = logging.getLogger(__name__)
 
 IS_WINDOWS = sys.platform == "win32"
-STREAM_FALLBACK_CHUNK_SIZE = 160
-STREAM_FALLBACK_DELAY_S = 0.012
+STREAM_FALLBACK_CHUNK_SIZE = 80
+STREAM_FALLBACK_DELAY_S = 0.02
 
 
 class CLIAgent(ABC):
@@ -28,6 +28,7 @@ class CLIAgent(ABC):
         command: str,
         timeout: int = 300,
         model: str | None = None,
+        reasoning_effort: str | None = None,
         permission_mode: str = "acceptEdits",
         allowed_tools: str | None = None,
         system_prompt: str | None = None,
@@ -36,6 +37,7 @@ class CLIAgent(ABC):
         self.command = command
         self.timeout = timeout
         self.model = model
+        self.reasoning_effort = reasoning_effort
         self.permission_mode = permission_mode
         self.allowed_tools = allowed_tools
         self.system_prompt = system_prompt
@@ -239,7 +241,7 @@ class CLIAgent(ABC):
             assert process.stdout is not None
             while True:
                 chunk = await asyncio.wait_for(
-                    process.stdout.read(4096), timeout=self.timeout
+                    process.stdout.read(512), timeout=self.timeout
                 )
                 if not chunk:
                     break

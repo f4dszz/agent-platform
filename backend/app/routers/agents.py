@@ -4,7 +4,14 @@ from sqlalchemy.ext.asyncio import AsyncSession
 
 from app.db.database import get_db
 from app.models.agent import AgentConfig
-from app.schemas.schemas import AgentRegister, AgentResponse, AgentStatusResponse, AgentUpdate
+from app.schemas.schemas import (
+    AgentCapabilitiesResponse,
+    AgentRegister,
+    AgentResponse,
+    AgentStatusResponse,
+    AgentUpdate,
+)
+from app.services.agent_capabilities import get_agent_capabilities
 
 router = APIRouter()
 
@@ -25,6 +32,7 @@ async def register_agent(body: AgentRegister, db: AsyncSession = Depends(get_db)
         agent_type=body.agent_type,
         command=body.command,
         model=body.model,
+        reasoning_effort=body.reasoning_effort,
         default_args=body.default_args,
         max_timeout=body.max_timeout,
         permission_mode=body.permission_mode,
@@ -56,6 +64,17 @@ async def get_agent(agent_name: str, db: AsyncSession = Depends(get_db)):
     if not agent:
         raise HTTPException(status_code=404, detail="Agent not found")
     return agent
+
+
+@router.get("/{agent_name}/capabilities", response_model=AgentCapabilitiesResponse)
+async def get_agent_capability(agent_name: str, db: AsyncSession = Depends(get_db)):
+    result = await db.execute(
+        select(AgentConfig).where(AgentConfig.name == agent_name)
+    )
+    agent = result.scalar_one_or_none()
+    if not agent:
+        raise HTTPException(status_code=404, detail="Agent not found")
+    return get_agent_capabilities(agent)
 
 
 @router.get("/{agent_name}/status", response_model=AgentStatusResponse)

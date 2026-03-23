@@ -4,6 +4,7 @@ Uses `codex exec` for non-interactive single-shot prompts.
 Parses the verbose output to extract the final agent response.
 """
 
+import json
 import logging
 import subprocess
 
@@ -37,13 +38,6 @@ class CodexAgent(CLIAgent):
         super().__init__(command=command, timeout=timeout, **kwargs)
 
     # Map platform permission_mode → codex --sandbox value
-    _SANDBOX_MAP = {
-        "acceptEdits": "workspace-write",
-        "bypassPermissions": "danger-full-access",
-        "plan": "read-only",
-        "default": "read-only",
-    }
-
     _EXECUTION_MODE_FLAGS = {
         # `codex exec` does not support `--ask-for-approval`; use its native
         # non-interactive modes and keep the prompt on stdin.
@@ -70,6 +64,10 @@ class CodexAgent(CLIAgent):
         ]
         if self.model:
             cmd.extend(["--model", self.model])
+        if self.reasoning_effort:
+            cmd.extend(
+                ["-c", f"model_reasoning_effort={json.dumps(self.reasoning_effort)}"]
+            )
         cmd.extend(self._EXECUTION_MODE_FLAGS.get(self.permission_mode, []))
 
         cmd.extend(self.get_default_args())
